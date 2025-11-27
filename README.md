@@ -1,22 +1,6 @@
 # ForgetMeNot - Dementia Care Assistant System
 
-A multimodal AI system for dementia care that combines real-time audio processing, face recognition, and contextual memory assistance to help patients recognize people in their lives through augmented reality glasses.
-
-## Table of Contents
-- [Overview](#overview)
-- [Key Features](#key-features)
-- [Architecture](#architecture)
-- [Data Flow](#data-flow)
-- [Technology Stack](#technology-stack)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Services](#services)
-- [API Endpoints](#api-endpoints)
-- [Voice Features](#voice-features)
-- [Face Recognition System](#face-recognition-system)
-- [Training and Fine-tuning](#training-and-fine-tuning)
-- [Performance Optimization](#performance-optimization)
-- [Future Improvements](#future-improvements)
+A multimodal AI system designed to support people with dementia by helping them recognize and remember loved ones through real-time audio processing, face recognition, and contextual memory assistance. This innovative solution combines cutting-edge artificial intelligence with augmented reality technology to provide meaningful cognitive support through AR glasses, helping individuals with dementia maintain connections with family members and friends. The system addresses the progressive memory loss and recognition difficulties that characterize dementia by offering gentle, context-aware reminders and personalized information displays that enhance daily interactions and quality of life for both patients and their families.
 
 ## Overview
 
