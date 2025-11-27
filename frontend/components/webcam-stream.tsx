@@ -47,7 +47,7 @@ interface FaceRecognitionResponse {
 
 type FacePersonMap = Map<string, PersonData>
 
-export default function WebcamStream() {
+export function WebcamStream() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
@@ -73,6 +73,12 @@ export default function WebcamStream() {
   const [modelsLoaded, setModelsLoaded] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [isModelLoading, setIsModelLoading] = useState(false)
+
+  // State for automatic face recognition
+  const [lastRecognizedFaces, setLastRecognizedFaces] = useState<Set<string>>(new Set())
+  const [isAutoRecognizing, setIsAutoRecognizing] = useState(false)
+  // Track the timestamp of last recognition for each face to allow re-recognition after a timeout
+  const [faceLastRecognitionTime, setFaceLastRecognitionTime] = useState<Map<string, number>>(new Map())
 
   const INFERENCE_BACKEND_URL = "http://localhost:8000"
   const OFFER_BACKEND_URL = "http://localhost:8000"
@@ -313,9 +319,53 @@ export default function WebcamStream() {
     }
   }
 
-  const recognizeFace = async () => {
+  // Effect for automatic face recognition when new faces are detected
+  useEffect(() => {
+    if (!isStreaming || isAutoRecognizing || detectedFaces.length === 0) {
+      return
+    }
+
+    // Check if we have new faces that haven't been recognized recently
+    // Allow re-recognition after 30 seconds
+    const RECOGNITION_TIMEOUT = 30000 // 30 seconds
+    const currentTime = Date.now()
+    
+    const newFaces = detectedFaces.filter(face => {
+      const lastRecognitionTime = faceLastRecognitionTime.get(face.id)
+      // If face was never recognized, or was recognized more than 30 seconds ago
+      return !lastRecognitionTime || (currentTime - lastRecognitionTime > RECOGNITION_TIMEOUT)
+    })
+    
+    if (newFaces.length > 0 && videoRef.current && canvasRef.current) {
+      // Start automatic recognition
+      setIsAutoRecognizing(true)
+      
+      // Recognize the most prominent new face
+      const mostProminentFace = newFaces.reduce((prev, current) => {
+        const prevScore = (prev.boundingBox.width * prev.boundingBox.height) * prev.confidence
+        const currentScore = (current.boundingBox.width * current.boundingBox.height) * current.confidence
+        return currentScore > prevScore ? current : prev
+      })
+      
+      console.log(`[AutoFaceRecognition] New face detected: ${mostProminentFace.id}, triggering automatic recognition`)
+      
+      // Perform face recognition automatically
+      recognizeFaceAutomatically()
+        .finally(() => {
+          // Update the last recognition time for this face
+          setFaceLastRecognitionTime(prev => {
+            const newMap = new Map(prev)
+            newMap.set(mostProminentFace.id, Date.now())
+            return newMap
+          })
+          setIsAutoRecognizing(false)
+        })
+    }
+  }, [detectedFaces, isStreaming, isAutoRecognizing, faceLastRecognitionTime])
+
+  const recognizeFaceAutomatically = async (): Promise<void> => {
     if (!videoRef.current || !canvasRef.current) {
-      console.error('[FaceRecognition] Video or canvas not available')
+      console.error('[AutoFaceRecognition] Video or canvas not available')
       return
     }
 
@@ -324,7 +374,7 @@ export default function WebcamStream() {
     const context = canvas.getContext('2d')
     
     if (!context) {
-      console.error('[FaceRecognition] Canvas context not available')
+      console.error('[AutoFaceRecognition] Canvas context not available')
       return
     }
 
@@ -351,10 +401,10 @@ export default function WebcamStream() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(faceRecognitionData)
         })
-
+        
         if (response.ok) {
           const result: FaceRecognitionResponse = await response.json()
-          console.log('[FaceRecognition] Recognition result:', result)
+          console.log('[AutoFaceRecognition] Recognition result:', result)
           
           if (result.known && result.person_id && result.name && result.relationship) {
             // Known person detected
@@ -364,57 +414,58 @@ export default function WebcamStream() {
               relationship: result.relationship,
               person_id: result.person_id
             })
-            console.log(`[FaceRecognition] Known person detected: ${result.name}`)
+            console.log(`[AutoFaceRecognition] Known person detected: ${result.name}`)
           } else {
-            // Unknown person detected
-            const newUnknownId = `unknown_${Date.now()}`
-            setUnknownPersonId(newUnknownId)
-            setIsListeningForName(true)
-            console.log('[FaceRecognition] Unknown person detected, listening for name')
-            
-            // Set latestPersonData for the unknown person so buttons appear
-            setLatestPersonData({
-              name: "Unknown Person",
-              description: "Recently detected unknown person",
-              relationship: "Unknown",
-              person_id: newUnknownId
-            })
-            
-            // Create a temporary person entry for the unknown person
-            // Add a small delay to ensure backend is ready
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            const tempPersonResponse = await fetch(`${OFFER_BACKEND_URL}/person`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                person_id: newUnknownId,
+            // Unknown person detected - check if we already have a temporary person for this session
+            if (!unknownPersonId) {
+              const newUnknownId = `unknown_${Date.now()}`
+              setUnknownPersonId(newUnknownId)
+              setIsListeningForName(true)
+              console.log('[AutoFaceRecognition] Unknown person detected, listening for name')
+              
+              // Set latestPersonData for the unknown person so buttons appear
+              setLatestPersonData({
                 name: "Unknown Person",
+                description: "Recently detected unknown person",
                 relationship: "Unknown",
-                aggregated_context: "Recently detected unknown person",
-                cached_description: "Recently detected unknown person"
+                person_id: newUnknownId
               })
-            }).catch(error => {
-              console.error('[FaceRecognition] Network error creating person:', error);
-              throw new Error(`Failed to connect to backend: ${error.message}`);
-            });
-            
-            if (tempPersonResponse.ok) {
-              console.log('[FaceRecognition] Created temporary person entry for unknown person')
-              // Immediately capture face embedding for this unknown person
-              await captureFaceEmbedding(newUnknownId)
-              // Keep the latestPersonData set so buttons remain visible
+              
+              // Create a temporary person entry for the unknown person
+              // Add a small delay to ensure backend is ready
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              
+              const tempPersonResponse = await fetch(`${OFFER_BACKEND_URL}/person`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  person_id: newUnknownId,
+                  name: "Unknown Person",
+                  relationship: "Unknown",
+                  aggregated_context: "Recently detected unknown person",
+                  cached_description: "Recently detected unknown person"
+                })
+              }).catch(error => {
+                console.error('[AutoFaceRecognition] Network error creating person:', error);
+                throw new Error(`Failed to connect to backend: ${error.message}`);
+              });
+              
+              if (tempPersonResponse.ok) {
+                console.log('[AutoFaceRecognition] Created temporary person entry for unknown person')
+                // Immediately capture face embedding for this unknown person
+                await captureFaceEmbedding(newUnknownId)
+                // Keep the latestPersonData set so buttons remain visible
+              }
             }
           }
         } else {
-          console.error('[FaceRecognition] Failed to recognize face:', response.status)
+          console.error('[AutoFaceRecognition] Failed to recognize face:', response.status)
         }
-      } catch (err) {
-        console.error('[FaceRecognition] Error recognizing face:', err)
+      } catch (error) {
+        console.error('[AutoFaceRecognition] Error during face recognition:', error)
       }
     } catch (err) {
-      console.error('[FaceRecognition] Error generating face embedding:', err)
-      alert('Error generating face embedding. Please try again.')
+      console.error('[AutoFaceRecognition] Error extracting face embedding:', err)
     }
   }
 
@@ -1047,7 +1098,7 @@ export default function WebcamStream() {
           <Button
             variant="default"
             className="rounded-full px-4"
-            onClick={recognizeFace}
+            onClick={recognizeFaceAutomatically}
           >
             Recognize Face
           </Button>

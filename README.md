@@ -12,9 +12,11 @@ A multimodal AI system for dementia care that combines real-time audio processin
 - [Usage](#usage)
 - [Services](#services)
 - [API Endpoints](#api-endpoints)
+- [Voice Features](#voice-features)
 - [Face Recognition System](#face-recognition-system)
 - [Training and Fine-tuning](#training-and-fine-tuning)
 - [Performance Optimization](#performance-optimization)
+- [Future Improvements](#future-improvements)
 
 ## Overview
 
@@ -35,6 +37,8 @@ The system consists of multiple interconnected services:
 - **Augmented Reality Display**: AR glasses simulation for displaying person information
 - **Cloud Integration**: Optional cloud-based processing for reduced local CPU load
 - **MongoDB Storage**: Persistent storage of person profiles, face embeddings, and conversation history
+- **Voice Conversation Logging**: Full word-for-word transcription and storage of all conversations
+- **Automatic Face Recognition**: No manual intervention required for face recognition
 
 ## Architecture
 
@@ -231,6 +235,13 @@ Processes conversation data and generates contextual reminders for AR display.
 | `/people` | GET | List all people |
 | `/face/embedding` | POST | Store face embedding for a person |
 | `/face/recognize` | POST | Recognize person by face embedding |
+| `/voice/transcribe_and_store` | POST | Transcribe audio and store conversation |
+| `/voice/infer_identity_from_audio` | POST | Infer name and relationship from audio |
+| `/voice/handle_unknown_speaker` | POST | Handle unknown speaker |
+| `/voice/last_conversation/{person_id}` | GET | Get last conversation summary |
+| `/voice/log_conversation` | POST | Log conversation with full transcript |
+| `/voice/context/{person_id}` | GET | Get conversation context for person |
+| `/person/promote_temporary` | POST | Promote temporary person to permanent |
 
 ### Face Recognition Service (Port 8001)
 
@@ -246,6 +257,189 @@ Processes conversation data and generates contextual reminders for AR display.
 | `/` | GET | Service information |
 | `/health` | GET | Health check with queue status |
 | `/stream/inference` | GET | SSE stream of processed inference results |
+
+## Voice Features
+
+### Voice Conversation Logging and Recall
+
+The system implements comprehensive voice conversation logging and recall functionality:
+
+#### Audio → Text → DB (Word-for-Word)
+
+1. **Transcription**: Uses Whisper (tiny model) to transcribe full audio clips word-for-word
+2. **Storage**: Stores complete conversation text without truncation or aggressive summarization
+3. **Dual Storage**: 
+   - Full history in `conversations` collection
+   - Recent history in `conversation_history` array in person documents
+
+#### POST /voice/log_conversation
+
+Logs a conversation by transcribing audio and storing the full transcript.
+
+**Request Body:**
+```json
+{
+  "person_id": "person_001", // Optional
+  "direction": "to_patient" or "from_patient" or "dialogue",
+  "audio": "base64_encoded_audio_data"
+}
+```
+
+**Response:**
+```json
+{
+  "person_id": "person_001",
+  "text": "Full transcribed text from audio",
+  "stored": true
+}
+```
+
+#### GET /voice/context/{person_id}
+
+Retrieves the conversation context for a person.
+
+**Response:**
+```json
+{
+  "person_id": "person_001",
+  "conversations": [
+    {
+      "timestamp": "2023-10-01T10:00:00Z",
+      "direction": "to_patient",
+      "text": "Full conversation text",
+      "source": "voice"
+    }
+  ],
+  "short_summary": "Brief contextual summary"
+}
+```
+
+### Last Conversation Memory Per Person
+
+The implementation uses a dual-level storage approach:
+
+#### Full History Storage
+- **Collection**: `conversations`
+- **Document Structure**:
+  ```json
+  {
+    "person_id": "person_001",
+    "timestamp": "2023-10-01T10:00:00Z",
+    "direction": "to_patient",
+    "text": "Hello, how are you today?",
+    "source": "voice"
+  }
+  ```
+
+#### Recent History Storage
+- **Field**: `conversation_history` in the person document
+- **Structure**: Array of conversation entries (last 20 entries)
+  ```json
+  {
+    "timestamp": "2023-10-01T10:00:00Z",
+    "direction": "to_patient",
+    "text": "Hello, how are you today?",
+    "source": "voice"
+  }
+  ```
+
+### Extract Name and Relationship from Voice-Only Conversations
+
+For initially unknown speakers, the system can extract identity information:
+
+#### POST /voice/infer_identity_from_audio
+
+Infers name and relationship from audio transcript for unknown speakers.
+
+**Request Body:**
+```json
+{
+  "audio": "base64_encoded_audio_data"
+}
+```
+
+**Response:**
+```json
+{
+  "transcript": "Hi, I'm John, your son.",
+  "extracted": {
+    "name": {
+      "value": "John",
+      "confidence": 0.9
+    },
+    "relationship": {
+      "value": "son",
+      "confidence": 0.9
+    }
+  }
+}
+```
+
+#### POST /voice/handle_unknown_speaker
+
+Handles unknown speakers by inferring identity and creating temporary person documents.
+
+**Request Body:**
+```json
+{
+  "audio": "base64_encoded_audio_data"
+}
+```
+
+**Response:**
+```json
+{
+  "person_id": "unknown_20231001_100000_a1b2c3d4",
+  "name": "John",
+  "relationship": "son",
+  "is_temporary": true,
+  "identity_confidence": {
+    "name": {
+      "value": "John",
+      "confidence": 0.9
+    },
+    "relationship": {
+      "value": "son",
+      "confidence": 0.9
+    }
+  },
+  "aggregated_context": "Inferred from voice-only conversation",
+  "cached_description": "Inferred from voice-only conversation",
+  "last_updated": "2023-10-01T10:00:00Z",
+  "face_embeddings": [],
+  "voice_profile": null,
+  "conversation_history": [
+    {
+      "timestamp": "2023-10-01T10:00:00Z",
+      "direction": "from_patient",
+      "text": "Hi, I'm John, your son.",
+      "source": "voice"
+    }
+  ]
+}
+```
+
+### Enhanced Features (v2)
+
+#### Confidence Mechanism
+- Enhanced extraction with confidence scores for both name and relationship
+- Confidence calculation based on pattern strength:
+  - Strong patterns (confidence 0.8-0.9): "my name is X", "i'm your Y X", "i am your Y X"
+  - Medium patterns (confidence 0.6-0.7): "i am X", "i'm X", "this is X"
+  - Weak patterns (confidence 0.5-0.6): Basic name mentions
+
+#### Audio Performance Improvements
+- Duration limiting: Maximum audio duration per request is 30 seconds
+- Transcription caching: In-memory cache with configurable size (default: 100 entries)
+
+#### Enhanced Last Conversation UX
+- Richer response with messages, short_summary, and keywords
+- Lightweight, deterministic summarization
+- Keyword extraction using basic NLP techniques
+
+#### Temporary Person Lifecycle Management
+- Enhanced temporary person model with confidence information
+- Promotion endpoint to convert temporary persons to permanent
 
 ## Face Recognition System
 
@@ -266,6 +460,20 @@ For improved recognition accuracy, the system supports multi-image enrollment:
 2. **Processing**: Each image is processed to extract face embeddings
 3. **Averaging**: Embeddings are averaged to improve recognition accuracy
 4. **Storage**: Averaged embedding is stored with model version information
+
+### Automatic Face Recognition
+
+The system automatically recognizes faces when someone enters the camera frame:
+
+1. When new faces are detected by the face detection system:
+   - Filter out faces that were recently recognized (within 30 seconds)
+   - Select the most prominent face (largest bounding box × confidence)
+   - Automatically trigger face recognition
+2. If face is recognized:
+   - Display person information immediately
+3. If face is unknown:
+   - Create temporary person entry
+   - Start listening for name identification through voice
 
 ### Error Handling
 
@@ -326,3 +534,8 @@ When API keys are provided, heavy AI processing is offloaded to cloud services, 
 3. **Model Caching**: Cache models for faster loading
 4. **Batch Processing**: Process multiple faces in a single image
 5. **Real-time Recognition**: Implement real-time face recognition in video streams
+6. **Improved Summarization**: Use LLM for more sophisticated conversation summaries
+7. **Enhanced NLP**: More robust name and relationship extraction with context awareness
+8. **Caregiver Confirmation**: Implement endpoint for caregiver to confirm/override inferred identities
+9. **Voice Profile Enrollment**: Integration with existing voice profile enrollment workflow
+10. **Multi-language Support**: Extend name/relationship extraction for other languages

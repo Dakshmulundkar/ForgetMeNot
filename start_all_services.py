@@ -3,43 +3,59 @@
 Script to start all services for the face recognition system
 """
 
-import subprocess
-import sys
 import os
-import time
+import sys
+import subprocess
 import signal
 import atexit
+import time
 
-# Global variables to track processes
+# Global list to track processes
 processes = []
 
-def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print("\n\n🛑 Shutting down all services...")
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    print("\n🛑 Shutting down services...")
     for process in processes:
         try:
-            process.terminate()
+            if os.name == 'nt':  # Windows
+                process.terminate()
+            else:  # Unix/Linux/Mac
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        except Exception as e:
-            print(f"Error stopping process: {e}")
-    
-    print("✅ All services stopped.")
+        except:
+            try:
+                if os.name == 'nt':  # Windows
+                    process.kill()
+                else:  # Unix/Linux/Mac
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except:
+                pass
+    print("✅ All services stopped")
     sys.exit(0)
 
 def start_process(command, name, cwd=None):
     """Start a process and track it"""
     try:
         print(f"🚀 Starting {name}...")
-        process = subprocess.Popen(
-            command, 
-            shell=True, 
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid  # Create new process group
-        )
+        if os.name == 'nt':  # Windows
+            process = subprocess.Popen(
+                command, 
+                shell=True, 
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+                # Removed preexec_fn=os.setsid as it's not available on Windows
+            )
+        else:  # Unix/Linux/Mac
+            process = subprocess.Popen(
+                command, 
+                shell=True, 
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid  # Create new process group
+            )
         processes.append(process)
         print(f"✅ {name} started (PID: {process.pid})")
         return process

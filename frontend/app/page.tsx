@@ -1,4 +1,4 @@
-import WebcamStream from "@/components/webcam-stream"
+import { WebcamStream } from "@/components/webcam-stream"
 
 export default function Home() {
   return (

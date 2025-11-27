@@ -1,6 +1,7 @@
 """Main inference service for AR glasses - handles two event types."""
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 # Use mock fireworks client instead of real one
-from database import create_person, get_person_by_id, update_person_context
+from database import create_person, get_person_by_id, update_person_context, update_voice_profile
 from mock_fireworks_client import (
     aggregate_conversation_context,
     generate_ar_description,
@@ -173,6 +174,23 @@ async def handle_conversation_end(event: ConversationEvent) -> None:
                 aggregated_context=updated_context,
                 cached_description=new_description,
             )
+            
+            # Update voice profile with a basic profile based on conversation
+            if updated:
+                # Create a simple voice profile based on conversation length and content
+                # In a real implementation, this would come from actual voice embeddings
+                conversation_text = " ".join([utterance.text for utterance in event.conversation])
+                # Simple hash-based "embedding" for demonstration
+                import hashlib
+                hash_object = hashlib.md5(conversation_text.encode())
+                embedding = [float(ord(c)) / 255.0 for c in hash_object.hexdigest()[:64]]
+                
+                voice_profile_data = {
+                    "embedding": embedding,
+                    "created_at": datetime.utcnow(),
+                    "sample_count": 1
+                }
+                update_voice_profile(event.person_id, voice_profile_data)
         except Exception as update_exc:  # noqa: BLE001
             logger.warning(
                 "Could not update person %s: %s", event.person_id, update_exc

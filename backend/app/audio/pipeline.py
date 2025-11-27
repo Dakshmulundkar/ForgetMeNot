@@ -335,19 +335,56 @@ class AudioPipeline:
             
             wav_buffer.seek(0)
             
-            # For now, we'll use a placeholder implementation
-            # In a real implementation, you would send the audio to Fireworks
-            logger.info("Using Fireworks API for transcription (placeholder implementation)")
+            # Call Fireworks API for transcription
+            logger.info("Using Fireworks API for transcription")
             
-            # Placeholder result - in a real implementation, you would call Fireworks
-            # result = await self._fireworks_client.audio.transcriptions.create(
-            #     file=wav_buffer,
-            #     model="whisper-large-v3",
-            #     response_format="verbose_json"
-            # )
+            # Create a temporary file-like object for the WAV data
+            from tempfile import NamedTemporaryFile
+            import os
             
-            # For now, return empty segments to avoid processing errors
-            return []
+            with NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                tmp_file.write(wav_buffer.getvalue())
+                tmp_file_path = tmp_file.name
+            
+            try:
+                # Upload and transcribe with Fireworks
+                with open(tmp_file_path, 'rb') as audio_file:
+                    transcript_response = await self._fireworks_client.audio.transcriptions.create(
+                        file=audio_file,
+                        model="whisper-large-v3",
+                        response_format="verbose_json"
+                    )
+                
+                # Clean up temporary file
+                os.unlink(tmp_file_path)
+                
+                # Parse the response and create TranscriptSegments
+                segments = []
+                if hasattr(transcript_response, 'segments'):
+                    for segment in transcript_response.segments:
+                        segments.append(TranscriptSegment(
+                            start=segment['start'],
+                            end=segment['end'],
+                            text=segment['text'],
+                            speaker=None  # Will be assigned later
+                        ))
+                else:
+                    # If no segments, create a single segment with the whole transcript
+                    segments.append(TranscriptSegment(
+                        start=0.0,
+                        end=len(audio) / self.config.target_sample_rate,
+                        text=transcript_response.text,
+                        speaker=None
+                    ))
+                
+                logger.info(f"Transcribed {len(segments)} segments")
+                return segments
+                
+            except Exception as e:
+                # Clean up temporary file even if transcription fails
+                if os.path.exists(tmp_file_path):
+                    os.unlink(tmp_file_path)
+                raise e
             
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cloud transcription failed: %s", exc)
@@ -521,9 +558,34 @@ class AudioPipeline:
             ]
         }
 
-        # Add to person's conversation history
+        # Import the add_conversation function
+        from inference.database import add_conversation
+        
+        # Store in conversations collection (full history)
+        for utterance in conversation:
+            if utterance.speaker and not utterance.speaker.startswith("speaker_unknown"):
+                # Add to full conversation history
+                success = add_conversation(
+                    person_id=utterance.speaker,
+                    direction="from_patient",  # Assuming all utterances are from the speaker to patient
+                    text=utterance.text,
+                    source="voice"
+                )
+                if success:
+                    logger.info(
+                        "Stored conversation entry in full history for person %s: %s",
+                        utterance.speaker,
+                        utterance.text[:50] + "..." if len(utterance.text) > 50 else utterance.text
+                    )
+                else:
+                    logger.warning(
+                        "Failed to store conversation entry in full history for person %s",
+                        utterance.speaker
+                    )
+
+        # Add to person's conversation history (recent history with trimming)
         if not primary_speaker.startswith("speaker_unknown"):
-            success = add_conversation_to_history(primary_speaker, conversation_event)
+            success = add_conversation_to_history(primary_speaker, conversation_event, max_history=20)
             if success:
                 logger.info(
                     "Stored conversation in history for person %s",

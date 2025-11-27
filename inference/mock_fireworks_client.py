@@ -80,9 +80,9 @@ async def infer_new_person_details(conversation: List[ConversationUtterance]) ->
     # Simple mock implementation
     return {
         "name": "New Person",
-        "relationship": "Someone you know",
+        "relationship": "New acquaintance",
         "aggregated_context": "First conversation with this person.",
-        "cached_description": "Just met today for the first time"
+        "cached_description": "Just met"
     }
 
 

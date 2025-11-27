@@ -52,6 +52,209 @@ def get_people_collection() -> Collection:
     return db["people"]
 
 
+def get_conversations_collection() -> Collection:
+    """Get the 'conversations' collection."""
+    db = get_database()
+    return db["conversations"]
+
+
+def add_conversation(person_id: str, direction: str, text: str, source: str = "voice") -> bool:
+    """
+    Add a conversation entry to the conversations collection.
+    
+    Args:
+        person_id: Person identifier
+        direction: Direction of conversation ("to_patient" or "from_patient")
+        text: Transcript text
+        source: Source of conversation ("voice" or other)
+        
+    Returns:
+        True if added successfully, False otherwise
+    """
+    try:
+        collection = get_conversations_collection()
+        conversation_doc = {
+            "person_id": person_id,
+            "timestamp": datetime.utcnow(),
+            "direction": direction,
+            "text": text,
+            "source": source
+        }
+        
+        result = collection.insert_one(conversation_doc)
+        logger.info(f"Added conversation entry for person: {person_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error adding conversation entry: {e}")
+        return False
+
+
+def store_conversation(person_id: str, text: str, direction: str, source: str = "voice") -> bool:
+    """
+    Store a full conversation entry in the conversations collection.
+    This is an alias for add_conversation to maintain compatibility.
+    
+    Args:
+        person_id: Person identifier
+        text: Full transcript text (word-for-word)
+        direction: Direction of conversation ("to_patient", "from_patient", or "dialogue")
+        source: Source of conversation ("voice" or other)
+        
+    Returns:
+        True if stored successfully, False otherwise
+    """
+    # For now, treat all conversations as "to_patient" as per user request
+    if direction == "from_patient":
+        direction = "to_patient"
+    
+    return add_conversation(person_id, direction, text, source)
+
+
+def get_recent_conversations(person_id: str, limit: int = 3) -> list:
+    """
+    Get the recent conversation entries for a person.
+    
+    Args:
+        person_id: Person identifier
+        limit: Number of conversation entries to retrieve (default: 3)
+        
+    Returns:
+        List of conversation entries ordered by timestamp descending
+    """
+    try:
+        collection = get_conversations_collection()
+        conversations = list(collection.find({"person_id": person_id}).sort("timestamp", -1).limit(limit))
+        
+        # Convert MongoDB documents to JSON-serializable format
+        for conversation in conversations:
+            if '_id' in conversation:
+                del conversation['_id']
+            # Handle timestamp conversion
+            if 'timestamp' in conversation:
+                if isinstance(conversation['timestamp'], datetime):
+                    conversation['timestamp'] = conversation['timestamp'].isoformat()
+                # If it's already a string, leave it as is
+                
+        return conversations
+    except Exception as e:
+        logger.error(f"Error retrieving recent conversations for person {person_id}: {e}")
+        return []
+
+
+def get_last_conversations(person_id: str, limit: int = 10) -> list:
+    """
+    Get the last N conversation entries for a person.
+    
+    Args:
+        person_id: Person identifier
+        limit: Number of conversation entries to retrieve
+        
+    Returns:
+        List of conversation entries
+    """
+    try:
+        collection = get_conversations_collection()
+        conversations = list(collection.find({"person_id": person_id}).sort("timestamp", -1).limit(limit))
+        
+        # Convert MongoDB documents to JSON-serializable format
+        for conversation in conversations:
+            if '_id' in conversation:
+                del conversation['_id']
+            # Handle timestamp conversion
+            if 'timestamp' in conversation:
+                if isinstance(conversation['timestamp'], datetime):
+                    conversation['timestamp'] = conversation['timestamp'].isoformat()
+                # If it's already a string, leave it as is
+                
+        return conversations
+    except Exception as e:
+        logger.error(f"Error retrieving conversations for person {person_id}: {e}")
+        return []
+
+
+def get_last_conversation_summary(person_id: str, limit: int = 5) -> str:
+    """
+    Get a summary of the last N conversation entries for a person.
+    
+    Args:
+        person_id: Person identifier
+        limit: Number of conversation entries to summarize
+        
+    Returns:
+        Summary string of recent conversations
+    """
+    try:
+        conversations = get_last_conversations(person_id, limit)
+        if not conversations:
+            return "No previous conversations found."
+        
+        # Simple concatenation for now - can be enhanced with LLM summarization
+        summary_parts = []
+        for conv in conversations:
+            # Make sure we have the required fields
+            if "direction" in conv and "text" in conv:
+                direction = "You said" if conv["direction"] == "from_patient" else "They said"
+                summary_parts.append(f"{direction}: {conv['text']}")
+        
+        # Join with spaces and limit length for readability
+        summary = " ".join(summary_parts)
+        if len(summary) > 200:  # Limit summary length
+            summary = summary[:200] + "..."
+        
+        return summary if summary else "No previous conversations found."
+    except Exception as e:
+        logger.error(f"Error generating conversation summary for person {person_id}: {e}")
+        return "Unable to generate conversation summary."
+
+
+def create_temporary_person(name: str = "Unknown", relationship: str = "Unknown") -> dict:
+    """
+    Create a temporary person document for unknown speakers.
+    
+    Args:
+        name: Person's name (if known)
+        relationship: Relationship to patient (if known)
+        
+    Returns:
+        Created temporary person document
+    """
+    try:
+        from datetime import datetime
+        import uuid
+        
+        # Generate a temporary person ID
+        person_id = f"unknown_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        
+        # Create person document
+        person_doc = {
+            "person_id": person_id,
+            "name": name if name else "Unknown",
+            "relationship": relationship if relationship else "Unknown",
+            "aggregated_context": "Inferred from voice-only conversation",
+            "cached_description": "Inferred from voice-only conversation",
+            "last_updated": datetime.utcnow(),
+            "face_embeddings": [],
+            "voice_profile": None,
+            "conversation_history": [],
+            "is_temporary": True,
+            "identity_confidence": 0.0
+        }
+        
+        # Insert into people collection
+        collection = get_people_collection()
+        result = collection.insert_one(person_doc)
+        logger.info(f"Created temporary person: {person_doc['name']} ({person_id})")
+        
+        # Remove MongoDB-specific fields for JSON serialization
+        if '_id' in person_doc:
+            del person_doc['_id']
+            
+        return person_doc
+    except Exception as e:
+        logger.error(f"Error creating temporary person: {e}")
+        raise
+
+
 def get_person_by_id(person_id: str) -> Optional[dict]:
     """
     Retrieve a person document by person_id.
@@ -214,36 +417,54 @@ def update_voice_profile(person_id: str, voice_profile: dict) -> bool:
         return False
 
 
-def add_conversation_to_history(person_id: str, conversation: dict) -> bool:
+def add_conversation_to_history(person_id: str, conversation: dict, max_history: int = 20) -> bool:
     """
-    Add a conversation to a person's history.
-
+    Add a conversation to a person's history, keeping only the last N entries.
+    
     Args:
         person_id: Person identifier
         conversation: Conversation event data
-
+        max_history: Maximum number of conversation entries to keep (default: 20)
+        
     Returns:
         True if added, False if person not found
     """
-    collection = get_people_collection()
-
-    result = collection.update_one(
-        {"person_id": person_id},
-        {
-            "$push": {
-                "conversation_history": conversation
-            },
-            "$set": {
-                "last_updated": datetime.utcnow()
+    try:
+        collection = get_people_collection()
+        
+        # First push the new conversation
+        result = collection.update_one(
+            {"person_id": person_id},
+            {
+                "$push": {
+                    "conversation_history": conversation
+                },
+                "$set": {
+                    "last_updated": datetime.utcnow()
+                }
             }
-        }
-    )
-
-    if result.matched_count > 0:
-        logger.info(f"Added conversation to history for person: {person_id}")
-        return True
-    else:
-        logger.warning(f"Person not found for conversation history update: {person_id}")
+        )
+        
+        if result.matched_count > 0:
+            # Then trim the conversation history to keep only the last N entries
+            collection.update_one(
+                {"person_id": person_id},
+                {
+                    "$push": {
+                        "conversation_history": {
+                            "$each": [],
+                            "$slice": -max_history
+                        }
+                    }
+                }
+            )
+            logger.info(f"Added conversation to history for person: {person_id} (trimmed to last {max_history} entries)")
+            return True
+        else:
+            logger.warning(f"Person not found for conversation history update: {person_id}")
+            return False
+    except Exception as e:
+        logger.error(f"Error adding conversation to history for person {person_id}: {e}")
         return False
 
 
@@ -351,3 +572,60 @@ def close_connection():
         _client = None
         _db = None
         logger.info("MongoDB connection closed")
+
+
+def promote_temporary_person(person_id: str, name: str = None, relationship: str = None) -> bool:
+    """
+    Promote a temporary person to a permanent person.
+    
+    Args:
+        person_id: Person identifier
+        name: Updated name (optional)
+        relationship: Updated relationship (optional)
+        
+    Returns:
+        True if promoted successfully, False otherwise
+    """
+    try:
+        collection = get_people_collection()
+        
+        # Check if person exists and is temporary
+        person = collection.find_one({"person_id": person_id})
+        if not person:
+            logger.warning(f"Person not found: {person_id}")
+            return False
+            
+        if not person.get("is_temporary", False):
+            logger.warning(f"Person {person_id} is not temporary")
+            return False
+        
+        # Prepare update fields
+        update_fields = {
+            "is_temporary": False,
+            "identity_confidence": 1.0,
+            "last_updated": datetime.utcnow()
+        }
+        
+        # Update name if provided
+        if name:
+            update_fields["name"] = name
+            
+        # Update relationship if provided
+        if relationship:
+            update_fields["relationship"] = relationship
+            
+        # Update the person document
+        result = collection.update_one(
+            {"person_id": person_id},
+            {"$set": update_fields}
+        )
+        
+        if result.matched_count > 0:
+            logger.info(f"Promoted temporary person {person_id} to permanent")
+            return True
+        else:
+            logger.warning(f"Failed to promote temporary person {person_id}")
+            return False
+    except Exception as e:
+        logger.error(f"Error promoting temporary person {person_id}: {e}")
+        return False
