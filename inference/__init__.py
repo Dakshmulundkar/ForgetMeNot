@@ -1,0 +1,1 @@
+"""Inference package for the dementia care application."""
