@@ -154,19 +154,13 @@ async def handle_conversation_end(event: ConversationEvent) -> None:
     logger.info(f"Conversation: {len(event.conversation)} utterances")
 
     try:
-        # Call Fireworks Model #1: Aggregate conversation context
-        updated_context = await aggregate_conversation_context(
-            person_name=person_doc["name"],
-            current_context=person_doc["aggregated_context"],
-            new_conversation=event.conversation,
-        )
+        # Use humanized context generation instead of Fireworks model
+        from database import get_conversation_context_for_person
+        context_info = get_conversation_context_for_person(event.person_id, num_recent=3)
+        updated_context = context_info.get('humanized_summary', 'Recent conversations.')
 
-        # Call Fireworks Model #2: Generate AR description
-        new_description = await generate_ar_description(
-            person_name=person_doc["name"],
-            relationship=person_doc["relationship"],
-            aggregated_context=updated_context,
-        )
+        # Generate AR description based on humanized context
+        new_description = context_info.get('humanized_summary', f"Recent interaction with {person_doc['name']}.")
 
         try:
             updated = update_person_context(
@@ -181,7 +175,6 @@ async def handle_conversation_end(event: ConversationEvent) -> None:
                 # In a real implementation, this would come from actual voice embeddings
                 conversation_text = " ".join([utterance.text for utterance in event.conversation])
                 # Simple hash-based "embedding" for demonstration
-                import hashlib
                 hash_object = hashlib.md5(conversation_text.encode())
                 embedding = [float(ord(c)) / 255.0 for c in hash_object.hexdigest()[:64]]
                 
@@ -269,9 +262,9 @@ async def generate_inference_results() -> AsyncGenerator[dict, None]:
 
     try:
         while True:
-            # Wait for next result with timeout to send keepalive
+            # Wait for next result with timeout to send keepalive - MAXIMUM TIMEOUT FOR STABILITY
             try:
-                result = await asyncio.wait_for(result_queue.get(), timeout=30.0)
+                result = await asyncio.wait_for(result_queue.get(), timeout=60.0)  # Increased from 30.0 to 60.0
                 yield {
                     "event": "inference",
                     "data": result.model_dump_json(),
@@ -325,4 +318,11 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8002, log_level="info")
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8002, 
+        log_level="info",
+        timeout_keep_alive=60,  # Maximum keep alive timeout
+        timeout_graceful_shutdown=60  # Maximum graceful shutdown timeout
+    )

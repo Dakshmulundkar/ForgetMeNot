@@ -20,10 +20,20 @@ FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 FIREWORKS_MODEL = os.getenv("FIREWORKS_MODEL", "accounts/fireworks/models/llama-v3p1-70b-instruct")
 
 # Initialize Fireworks client (uses OpenAI-compatible API)
-client = AsyncOpenAI(
-    api_key=FIREWORKS_API_KEY,
-    base_url="https://api.fireworks.ai/inference/v1"
-)
+client = None
+if FIREWORKS_API_KEY:
+    try:
+        client = AsyncOpenAI(
+            api_key=FIREWORKS_API_KEY,
+            base_url="https://api.fireworks.ai/inference/v1"
+        )
+        logger.info("Fireworks client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Fireworks client: {e}")
+        client = None
+else:
+    logger.warning("FIREWORKS_API_KEY not set in environment variables")
+    client = None
 
 
 async def aggregate_conversation_context(

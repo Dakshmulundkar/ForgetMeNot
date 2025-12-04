@@ -1,196 +1,140 @@
 #!/usr/bin/env python3
 """
-Script to start all services for the face recognition system
+Script to start all services for the dementia assistant application.
+This replaces the need to manually start each service in a new terminal.
 """
 
-import os
-import sys
 import subprocess
+import sys
+import os
 import signal
-import atexit
 import time
+from typing import List
 
-# Global list to track processes
-processes = []
+# Global list to keep track of subprocesses
+processes: List[subprocess.Popen] = []
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals"""
-    print("\n🛑 Shutting down services...")
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully by terminating all subprocesses."""
+    print("\n\nReceived interrupt signal. Shutting down all services...")
     for process in processes:
         try:
-            if os.name == 'nt':  # Windows
-                process.terminate()
-            else:  # Unix/Linux/Mac
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.terminate()
             process.wait(timeout=5)
-        except:
-            try:
-                if os.name == 'nt':  # Windows
-                    process.kill()
-                else:  # Unix/Linux/Mac
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except:
-                pass
-    print("✅ All services stopped")
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    print("All services stopped.")
     sys.exit(0)
 
-def start_process(command, name, cwd=None):
-    """Start a process and track it"""
-    try:
-        print(f"🚀 Starting {name}...")
-        if os.name == 'nt':  # Windows
-            process = subprocess.Popen(
-                command, 
-                shell=True, 
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-                # Removed preexec_fn=os.setsid as it's not available on Windows
-            )
-        else:  # Unix/Linux/Mac
-            process = subprocess.Popen(
-                command, 
-                shell=True, 
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid  # Create new process group
-            )
-        processes.append(process)
-        print(f"✅ {name} started (PID: {process.pid})")
-        return process
-    except Exception as e:
-        print(f"❌ Failed to start {name}: {e}")
-        return None
-
-def check_service_health(url, service_name, timeout=30):
-    """Check if a service is healthy"""
-    import requests
-    import time
-    
-    print(f"🔍 Checking {service_name} health...")
-    
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                print(f"✅ {service_name} is healthy")
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        
-        time.sleep(2)
-    
-    print(f"❌ {service_name} failed health check")
-    return False
+def start_service(command: List[str], name: str, cwd: str = None, shell: bool = False) -> subprocess.Popen:
+    """Start a service and add it to the processes list."""
+    print(f"Starting {name}...")
+    # On Windows, we need shell=True for npm commands
+    if shell:
+        process = subprocess.Popen(
+            ' '.join(command) if isinstance(command, list) else command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            cwd=cwd,
+            shell=True
+        )
+    else:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            cwd=cwd
+        )
+    processes.append(process)
+    return process
 
 def main():
-    """Main function to start all services"""
-    print("🚀 Starting Face Recognition System Services...")
-    print("=" * 50)
-    
-    # Register signal handler for graceful shutdown
+    # Set up signal handler for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
     
-    # Change to project root directory
+    # Get the project root directory
     project_root = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(project_root)
-    print(f"📂 Working directory: {project_root}")
+    
+    print("Starting all dementia assistant services...")
+    print("=" * 50)
     
     # Start MongoDB (if not already running)
-    # Note: This assumes MongoDB is installed and in PATH
-    # In production, you would use a proper MongoDB deployment
-    print("\n🔄 Checking MongoDB...")
-    try:
-        # Just check if MongoDB is accessible
-        import pymongo
-        client = pymongo.MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=2000)
-        client.server_info()  # Will throw an exception if can't connect
-        print("✅ MongoDB is running")
-    except Exception as e:
-        print("⚠️  MongoDB not accessible - please ensure MongoDB is running")
-        print("   You can start MongoDB with: mongod")
+    # Note: This assumes MongoDB is installed as a service or can be started manually
+    print("Note: Make sure MongoDB is running on localhost:27017")
+    print("If not, start it with: mongod --dbpath /path/to/db")
+    print()
     
-    # Start Face Recognition Service
-    print("\n🚀 Starting Face Recognition Service...")
-    face_service_process = start_process(
-        "python backend/face_recognition_service/main.py",
-        "Face Recognition Service",
-        cwd=project_root
-    )
+    # Start main backend service (port 8000) with maximum timeout settings
+    backend_process = start_service([
+        sys.executable, "-m", "uvicorn", 
+        "backend.app.main:app", 
+        "--reload", 
+        "--host", "127.0.0.1",
+        "--port", "8000",
+        "--timeout-keep-alive", "60",
+        "--timeout-graceful-shutdown", "60"
+    ], "Main Backend Service")
     
-    if not face_service_process:
-        print("❌ Failed to start Face Recognition Service")
-        return False
+    # Start face recognition service (port 8001) with maximum timeout settings
+    face_process = start_service([
+        sys.executable, "-m", "uvicorn", 
+        "backend.face_recognition_service.main:app", 
+        "--reload", 
+        "--host", "127.0.0.1",
+        "--port", "8001",
+        "--timeout-keep-alive", "60",
+        "--timeout-graceful-shutdown", "60"
+    ], "Face Recognition Service")
     
-    # Wait a moment for the service to start
-    time.sleep(3)
+    # Start inference service (port 8002) with maximum timeout settings
+    inference_process = start_service([
+        sys.executable, "-m", "uvicorn", 
+        "inference.main:app", 
+        "--reload", 
+        "--host", "127.0.0.1",
+        "--port", "8002",
+        "--timeout-keep-alive", "60",
+        "--timeout-graceful-shutdown", "60"
+    ], "Inference Service")
     
-    # Check if Face Recognition Service is healthy
-    if not check_service_health("http://localhost:8001/health", "Face Recognition Service"):
-        print("❌ Face Recognition Service failed to start properly")
-        return False
+    # Give services time to initialize
+    print("Waiting for services to initialize...")
+    time.sleep(5)  # Wait 5 seconds for services to start up
     
-    # Start Main Backend Service
-    print("\n🚀 Starting Main Backend Service...")
-    backend_process = start_process(
-        "python -m uvicorn backend.app.main:app --reload --port 8000",
-        "Main Backend Service",
-        cwd=project_root
-    )
+    # Start frontend (port 3000)
+    # On Windows, we need to use shell=True for npm commands
+    if os.name == 'nt':  # Windows
+        frontend_process = start_service([
+            "npm", "run", "dev"
+        ], "Frontend Service", cwd=os.path.join(project_root, "frontend"), shell=True)
+    else:  # Unix/Linux/Mac
+        frontend_process = start_service([
+            "npm", "run", "dev"
+        ], "Frontend Service", cwd=os.path.join(project_root, "frontend"))
     
-    if not backend_process:
-        print("❌ Failed to start Main Backend Service")
-        return False
-    
-    # Wait a moment for the service to start
-    time.sleep(3)
-    
-    # Check if Main Backend Service is healthy
-    if not check_service_health("http://localhost:8000/", "Main Backend Service"):
-        print("❌ Main Backend Service failed to start properly")
-        return False
-    
-    # Start Frontend Service
-    print("\n🚀 Starting Frontend Service...")
-    frontend_process = start_process(
-        "npm run dev",
-        "Frontend Service",
-        cwd=os.path.join(project_root, "frontend")
-    )
-    
-    if not frontend_process:
-        print("❌ Failed to start Frontend Service")
-        return False
-    
-    # Register cleanup function
-    atexit.register(signal_handler, None, None)
-    
-    print("\n" + "=" * 50)
-    print("🎉 All services started successfully!")
-    print("\n🌐 Access the application at:")
-    print("   Frontend: http://localhost:3000")
-    print("   Main Backend API: http://localhost:8000")
-    print("   Face Recognition Service: http://localhost:8001")
-    print("\n💡 Press Ctrl+C to stop all services")
+    print("All services started successfully!")
+    print("Access the application at: http://localhost:3000")
+    print("Press Ctrl+C to stop all services")
     print("=" * 50)
     
-    # Keep the script running
+    # Monitor processes and restart if any fail
     try:
-        # Wait for any process to exit
         while True:
             time.sleep(1)
-            # Check if any process has exited
-            for process in processes:
+            # Check if any process has terminated unexpectedly
+            for i, process in enumerate(processes):
                 if process.poll() is not None:
-                    print(f"⚠️  Process {process.pid} has exited")
-                    return False
+                    print(f"Warning: Process {i} has terminated unexpectedly")
+                    # You might want to restart the process here
     except KeyboardInterrupt:
         signal_handler(signal.SIGINT, None)
 
 if __name__ == "__main__":
-    success = main()
-    if not success:
-        sys.exit(1)
+    main()

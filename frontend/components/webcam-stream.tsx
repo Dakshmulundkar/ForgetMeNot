@@ -16,6 +16,7 @@ import {
   calculateNotificationPosition,
 } from "@/lib/coordinate-mapper"
 import * as faceapi from 'face-api.js'
+import type { DetectedFace } from '@/lib/face-tracker'
 
 interface PersonData {
   name: string
@@ -43,6 +44,7 @@ interface FaceRecognitionResponse {
   description?: string
   conversation_history?: any[]
   message?: string
+  similarity?: number  // NEW: Add similarity property
 }
 
 type FacePersonMap = Map<string, PersonData>
@@ -79,6 +81,17 @@ export function WebcamStream() {
   const [isAutoRecognizing, setIsAutoRecognizing] = useState(false)
   // Track the timestamp of last recognition for each face to allow re-recognition after a timeout
   const [faceLastRecognitionTime, setFaceLastRecognitionTime] = useState<Map<string, number>>(new Map())
+  
+  // NEW: Add face recognition cache
+  const [faceRecognitionCache, setFaceRecognitionCache] = useState<Map<string, {
+    person_id: string;
+    similarity: number;
+    timestamp: number;
+  }>>(new Map())
+
+  // NEW: Activity tracking for session management
+  const [lastActivityTimestamp, setLastActivityTimestamp] = useState<number>(Date.now())
+  const [isSessionActive, setIsSessionActive] = useState<boolean>(true)
 
   const INFERENCE_BACKEND_URL = "http://localhost:8000"
   const OFFER_BACKEND_URL = "http://localhost:8000"
@@ -132,6 +145,18 @@ export function WebcamStream() {
     })
   }, [detectedFaces, latestPersonData])
 
+  // NEW: Update activity timestamp when recognition result comes back
+  useEffect(() => {
+    if (latestPersonData) {
+      // Recognition result received - update timestamp
+      setLastActivityTimestamp(Date.now());
+      if (!isSessionActive) {
+        console.log('[Session] Recognition result received, marking session as active');
+        setIsSessionActive(true);
+      }
+    }
+  }, [latestPersonData, isSessionActive]);
+
   useEffect(() => {
     startWebcam()
     connectSSE()
@@ -141,6 +166,45 @@ export function WebcamStream() {
       disconnectSSE()
     }
   }, [])
+
+  // NEW: Activity monitor effect
+  useEffect(() => {
+    // Only run if we're streaming
+    if (!isStreaming) return;
+
+    // Set up activity monitoring interval
+    const activityMonitorInterval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceLastActivity = now - lastActivityTimestamp;
+      
+      // If no activity for 30 seconds, mark session as idle
+      if (timeSinceLastActivity > 30000 && isSessionActive) {
+        console.log('[Session] No activity for 30 seconds, marking session as idle');
+        setIsSessionActive(false);
+        // Clear active person state but keep WebSocket and camera running
+        setLatestPersonData(null);
+        setFacePersonData(new Map());
+        setUnknownPersonId(null);
+        setIsListeningForName(false);
+      }
+    }, 5000); // Check every 5 seconds
+
+    return () => {
+      clearInterval(activityMonitorInterval);
+    };
+  }, [isStreaming, lastActivityTimestamp, isSessionActive]);
+
+  // NEW: Update activity timestamp when face is detected
+  useEffect(() => {
+    if (detectedFaces.length > 0) {
+      // Face activity detected - update timestamp
+      setLastActivityTimestamp(Date.now());
+      if (!isSessionActive) {
+        console.log('[Session] Face detected, marking session as active');
+        setIsSessionActive(true);
+      }
+    }
+  }, [detectedFaces, isSessionActive]);
 
   const connectSSE = () => {
     try {
@@ -216,60 +280,122 @@ export function WebcamStream() {
   }
 
   const setupWebSocket = async (stream: MediaStream) => {
-    try {
-      console.log('[WebSocket] Setting up WebSocket connection')
-      const websocket = new WebSocket('ws://localhost:8000/ws/audio')
-      
-      websocket.onopen = () => {
-        console.log('[WebSocket] Connected to audio streaming')
-        setIsConnected(true)
-        setWs(websocket)
-      }
-
-      websocket.onclose = () => {
-        console.log('[WebSocket] Disconnected from audio streaming')
-        setIsConnected(false)
-        setWs(null)
-      }
-
-      websocket.onerror = (error) => {
-        console.error('[WebSocket] Error:', error)
-        console.log('[WebSocket] This error occurs when the WebSocket connection fails. Make sure the backend is running at http://localhost:8000')
-        setIsConnected(false)
-      }
-
-      // Set up audio processing
-      const audioTracks = stream.getAudioTracks()
-      if (audioTracks.length > 0) {
-        const audioTrack = audioTracks[0]
-        const audioContext = new AudioContext()
-        const source = audioContext.createMediaStreamSource(stream)
-        const processor = audioContext.createScriptProcessor(4096, 1, 1)
+    // Track reconnection attempts
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 10;
+    const baseReconnectDelay = 1000; // 1 second
+    
+    const connect = () => {
+      try {
+        console.log('[WebSocket] Setting up WebSocket connection (attempt ' + (reconnectAttempts + 1) + ')');
+        const websocket = new WebSocket('ws://localhost:8000/ws/audio');
         
-        source.connect(processor)
-        processor.connect(audioContext.destination)
+        // Store the WebSocket instance
+        let heartbeatInterval: NodeJS.Timeout | null = null;
         
-        processor.onaudioprocess = (e) => {
-          if (websocket.readyState === WebSocket.OPEN) {
-            const inputData = e.inputBuffer.getChannelData(0)
-            // Convert float32 to int16
-            const buffer = new ArrayBuffer(inputData.length * 2)
-            const view = new DataView(buffer)
-            let index = 0
-            for (let i = 0; i < inputData.length; i++) {
-              const s = Math.max(-1, Math.min(1, inputData[i]))
-              view.setInt16(index, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
-              index += 2
+        websocket.onopen = () => {
+          console.log('[WebSocket] Connected to audio streaming');
+          setIsConnected(true);
+          setWs(websocket);
+          reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+          
+          // Start heartbeat to prevent disconnection - MAXIMUM FREQUENCY FOR STABILITY
+          heartbeatInterval = setInterval(() => {
+            if (websocket.readyState === WebSocket.OPEN) {
+              websocket.send(JSON.stringify({ type: 'heartbeat' }));
+              
+              // NEW: Update activity timestamp on heartbeat send (indicates connection is alive)
+              setLastActivityTimestamp(Date.now());
             }
-            websocket.send(buffer)
+          }, 5000); // Send heartbeat every 5 seconds for MAXIMUM stability
+        };
+
+        websocket.onclose = (event) => {
+          console.log('[WebSocket] Disconnected from audio streaming', event.reason);
+          setIsConnected(false);
+          setWs(null);
+          
+          // Clear heartbeat interval
+          if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
           }
+          
+          // Attempt to reconnect with exponential backoff
+          if (reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++;
+            const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), 30000); // Max 30s delay
+            console.log(`[WebSocket] Attempting to reconnect in ${delay}ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
+            setTimeout(connect, delay);
+          } else {
+            console.error('[WebSocket] Maximum reconnection attempts reached');
+            setIsConnected(false);
+          }
+        };
+
+        websocket.onerror = (error) => {
+          console.error('[WebSocket] Error:', error);
+          console.log('[WebSocket] This error occurs when the WebSocket connection fails. Make sure the backend is running at http://localhost:8000');
+          setIsConnected(false);
+          
+          // Clear heartbeat interval
+          if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+          }
+        };
+
+        // Set up audio processing
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          const audioTrack = audioTracks[0];
+          const audioContext = new AudioContext();
+          const source = audioContext.createMediaStreamSource(stream);
+          const processor = audioContext.createScriptProcessor(4096, 1, 1);
+          
+          source.connect(processor);
+          processor.connect(audioContext.destination);
+          
+          processor.onaudioprocess = (e) => {
+            if (websocket.readyState === WebSocket.OPEN) {
+              const inputData = e.inputBuffer.getChannelData(0);
+              // Convert float32 to int16
+              const buffer = new ArrayBuffer(inputData.length * 2);
+              const view = new DataView(buffer);
+              let index = 0;
+              for (let i = 0; i < inputData.length; i++) {
+                const s = Math.max(-1, Math.min(1, inputData[i]));
+                view.setInt16(index, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                index += 2;
+              }
+              websocket.send(buffer);
+              
+              // NEW: Update activity timestamp when audio is sent
+              setLastActivityTimestamp(Date.now());
+              if (!isSessionActive) {
+                console.log('[Session] Audio chunk sent, marking session as active');
+                setIsSessionActive(true);
+              }
+            }
+          };
+        }
+      } catch (err) {
+        console.error('[WebSocket] Setup error:', err);
+        setIsConnected(false);
+        
+        // Attempt to reconnect
+        if (reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttempts), 30000);
+          console.log(`[WebSocket] Retrying connection in ${delay}ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})`);
+          setTimeout(connect, delay);
         }
       }
-    } catch (err) {
-      console.error('[WebSocket] Setup error:', err)
-      setIsConnected(false)
-    }
-  }
+    };
+    
+    // Initial connection
+    connect();
+  };
 
   const setupWebRTC = async (stream: MediaStream) => {
     // This function is now deprecated since we're using WebSocket
@@ -326,68 +452,127 @@ export function WebcamStream() {
     }
 
     // Check if we have new faces that haven't been recognized recently
-    // Allow re-recognition after 30 seconds
-    const RECOGNITION_TIMEOUT = 30000 // 30 seconds
+    // NEW: Increase re-recognition timeout from 30s to 60s
+    const RECOGNITION_TIMEOUT = 60000 // 60 seconds
     const currentTime = Date.now()
     
     const newFaces = detectedFaces.filter(face => {
       const lastRecognitionTime = faceLastRecognitionTime.get(face.id)
-      // If face was never recognized, or was recognized more than 30 seconds ago
+      // If face was never recognized, or was recognized more than 60 seconds ago
       return !lastRecognitionTime || (currentTime - lastRecognitionTime > RECOGNITION_TIMEOUT)
     })
     
-    if (newFaces.length > 0 && videoRef.current && canvasRef.current) {
+    // NEW: Limit parallel recognitions to a reasonable number (e.g., 3 faces) to avoid CPU overload
+    const MAX_PARALLEL_RECOGNITIONS = 3
+    const facesToProcess = newFaces.slice(0, MAX_PARALLEL_RECOGNITIONS)
+    
+    // NEW: Process ALL detected faces in parallel instead of just the most prominent one
+    if (facesToProcess.length > 0 && videoRef.current && canvasRef.current) {
       // Start automatic recognition
       setIsAutoRecognizing(true)
       
-      // Recognize the most prominent new face
-      const mostProminentFace = newFaces.reduce((prev, current) => {
-        const prevScore = (prev.boundingBox.width * prev.boundingBox.height) * prev.confidence
-        const currentScore = (current.boundingBox.width * current.boundingBox.height) * current.confidence
-        return currentScore > prevScore ? current : prev
-      })
+      console.log(`[AutoFaceRecognition] New faces detected: ${newFaces.length}, triggering automatic recognition for up to ${MAX_PARALLEL_RECOGNITIONS} faces`)
       
-      console.log(`[AutoFaceRecognition] New face detected: ${mostProminentFace.id}, triggering automatic recognition`)
-      
-      // Perform face recognition automatically
-      recognizeFaceAutomatically()
-        .finally(() => {
+      // Perform face recognition for ALL new faces in parallel
+      Promise.all(facesToProcess.map(async (face) => {
+        try {
+          await recognizeFaceAutomaticallyForFace(face)
           // Update the last recognition time for this face
           setFaceLastRecognitionTime(prev => {
             const newMap = new Map(prev)
-            newMap.set(mostProminentFace.id, Date.now())
+            newMap.set(face.id, Date.now())
             return newMap
           })
-          setIsAutoRecognizing(false)
-        })
+        } catch (error) {
+          console.error(`[AutoFaceRecognition] Error recognizing face ${face.id}:`, error)
+        }
+      })).finally(() => {
+        setIsAutoRecognizing(false)
+      })
     }
   }, [detectedFaces, isStreaming, isAutoRecognizing, faceLastRecognitionTime])
 
-  const recognizeFaceAutomatically = async (): Promise<void> => {
-    if (!videoRef.current || !canvasRef.current) {
-      console.error('[AutoFaceRecognition] Video or canvas not available')
-      return
+  // NEW: Function to manually trigger face recognition for all detected faces
+  const recognizeFaceAutomatically = async () => {
+    if (!isStreaming || detectedFaces.length === 0) {
+      console.log('[ManualFaceRecognition] No faces detected or streaming not active');
+      return;
     }
 
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    const context = canvas.getContext('2d')
+    console.log(`[ManualFaceRecognition] Manually triggering recognition for ${detectedFaces.length} faces`);
+    
+    // Process ALL detected faces in parallel
+    setIsAutoRecognizing(true);
+    
+    try {
+      await Promise.all(detectedFaces.map(async (face) => {
+        try {
+          await recognizeFaceAutomaticallyForFace(face);
+          // Update the last recognition time for this face
+          setFaceLastRecognitionTime(prev => {
+            const newMap = new Map(prev);
+            newMap.set(face.id, Date.now());
+            return newMap;
+          });
+        } catch (error) {
+          console.error(`[ManualFaceRecognition] Error recognizing face ${face.id}:`, error);
+        }
+      }));
+    } finally {
+      setIsAutoRecognizing(false);
+    }
+  };
+
+  // NEW: Function to recognize a specific face
+  const recognizeFaceAutomaticallyForFace = async (face: DetectedFace): Promise<void> => {
+    if (!videoRef.current || !canvasRef.current) {
+      console.error('[AutoFaceRecognition] Video or canvas not available');
+      return;
+    }
+
+    // NEW: Check cache first
+    const cacheKey = `${face.boundingBox.originX.toFixed(0)}_${face.boundingBox.originY.toFixed(0)}_${face.boundingBox.width.toFixed(0)}_${face.boundingBox.height.toFixed(0)}`;
+    const cachedResult = faceRecognitionCache.get(cacheKey);
+    
+    // If cached result exists and is not too old (5 minutes), and has high similarity, use it
+    if (cachedResult && 
+        Date.now() - cachedResult.timestamp < 50000 && // 5 minutes
+        cachedResult.similarity > 0.85) {
+      console.log(`[AutoFaceRecognition] Using cached recognition result for face ${face.id}`);
+      
+      // Get person data from facePersonData or create temporary person
+      const cachedPersonData = facePersonData.get(face.id);
+      if (cachedPersonData) {
+        setLatestPersonData(cachedPersonData);
+        // Update last recognition time
+        setFaceLastRecognitionTime(prev => {
+          const newMap = new Map(prev);
+          newMap.set(face.id, Date.now());
+          return newMap;
+        });
+        return;
+      }
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const context = canvas.getContext('2d');
     
     if (!context) {
-      console.error('[AutoFaceRecognition] Canvas context not available')
-      return
+      console.error('[AutoFaceRecognition] Canvas context not available');
+      return;
     }
 
     // Set canvas dimensions to match video
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     
     // Draw current video frame to canvas
-    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
     
     try {
       // Extract face embedding using backend service
-      const faceEmbedding = await extractFaceEmbedding(canvas)
+      const faceEmbedding = await extractFaceEmbedding(canvas);
       
       // Create face recognition data
       const faceRecognitionData: FaceRecognitionData = {
@@ -404,21 +589,47 @@ export function WebcamStream() {
         
         if (response.ok) {
           const result: FaceRecognitionResponse = await response.json()
-          console.log('[AutoFaceRecognition] Recognition result:', result)
+          console.log(`[AutoFaceRecognition] Recognition result for face ${face.id}:`, result)
+          
+          // NEW: Cache the recognition result
+          if (result.known && result.person_id) {
+            const cacheKey = `${face.boundingBox.originX.toFixed(0)}_${face.boundingBox.originY.toFixed(0)}_${face.boundingBox.width.toFixed(0)}_${face.boundingBox.height.toFixed(0)}`;
+            setFaceRecognitionCache(prev => {
+              const newMap = new Map(prev);
+              newMap.set(cacheKey, {
+                person_id: result.person_id!,
+                similarity: result.similarity || 0.9, // Default high similarity for known persons
+                timestamp: Date.now()
+              });
+              return newMap;
+            });
+          }
           
           if (result.known && result.person_id && result.name && result.relationship) {
             // Known person detected
             setLatestPersonData({
-              name: result.name,
+              name: result.name || "Unknown",
               description: result.description || "No previous interactions",
-              relationship: result.relationship,
+              relationship: result.relationship || "Unknown",
               person_id: result.person_id
             })
             console.log(`[AutoFaceRecognition] Known person detected: ${result.name}`)
+            
+            // Associate this person with this specific face
+            setFacePersonData((prev: FacePersonMap) => {
+              const newMap = new Map(prev)
+              newMap.set(face.id, {
+                name: result.name || "Unknown",
+                description: result.description || "No previous interactions",
+                relationship: result.relationship || "Unknown",
+                person_id: result.person_id
+              })
+              return newMap
+            })
           } else {
             // Unknown person detected - check if we already have a temporary person for this session
             if (!unknownPersonId) {
-              const newUnknownId = `unknown_${Date.now()}`
+              const newUnknownId = `unknown_${Date.now()}_${face.id}`
               setUnknownPersonId(newUnknownId)
               setIsListeningForName(true)
               console.log('[AutoFaceRecognition] Unknown person detected, listening for name')
@@ -426,15 +637,127 @@ export function WebcamStream() {
               // Set latestPersonData for the unknown person so buttons appear
               setLatestPersonData({
                 name: "Unknown Person",
-                description: "Recently detected unknown person",
+                description: "Just met",
                 relationship: "Unknown",
                 person_id: newUnknownId
               })
               
+              // Associate this unknown person with this specific face
+              setFacePersonData((prev: FacePersonMap) => {
+                const newMap = new Map(prev)
+                newMap.set(face.id, {
+                  name: "Unknown Person",
+                  description: "Just met",
+                  relationship: "Unknown",
+                  person_id: newUnknownId
+                })
+                return newMap
+              })
+              
               // Create a temporary person entry for the unknown person
-              // Add a small delay to ensure backend is ready
+              // BUT first check if a person with this name already exists
               await new Promise(resolve => setTimeout(resolve, 1000));
               
+              // Check if person already exists
+              let shouldCreateTempPerson = true;
+              try {
+                const peopleResponse = await fetch(`${OFFER_BACKEND_URL}/people`);
+                if (peopleResponse.ok) {
+                  const people = await peopleResponse.json();
+                  // Look for a person with this person_id
+                  const existingUnknown = people.find((p: any) => 
+                    p.person_id === newUnknownId
+                  );
+                  
+                  if (existingUnknown) {
+                    console.log('[AutoFaceRecognition] Temporary person already exists, skipping creation');
+                    shouldCreateTempPerson = false;
+                  }
+                }
+              } catch (error) {
+                console.error('[AutoFaceRecognition] Error checking for existing temporary person:', error);
+              }
+              
+              if (shouldCreateTempPerson) {
+                const tempPersonResponse = await fetch(`${OFFER_BACKEND_URL}/person`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    person_id: newUnknownId,
+                    name: "Unknown Person",
+                    relationship: "Unknown",
+                    aggregated_context: "Just met",
+                    cached_description: "Just met"
+                  })
+                }).catch(error => {
+                  console.error('[AutoFaceRecognition] Network error creating person:', error);
+                  // Continue even if person creation fails
+                });
+                
+                if (tempPersonResponse && tempPersonResponse.ok) {
+                  console.log('[AutoFaceRecognition] Created temporary person entry for unknown person')
+                  // Immediately capture face embedding for this unknown person
+                  await captureFaceEmbedding(newUnknownId).catch(embeddingError => {
+                    console.error('[AutoFaceRecognition] Failed to capture face embedding:', embeddingError)
+                    // Continue even if face embedding fails
+                  })
+                }
+              }
+            }
+          }
+        } else {
+          console.error('[AutoFaceRecognition] Failed to recognize face:', response.status)
+          // Even if recognition fails, we still want to create a temporary person
+          if (!unknownPersonId) {
+            const newUnknownId = `unknown_${Date.now()}_${face.id}`
+            setUnknownPersonId(newUnknownId)
+            setIsListeningForName(true)
+            console.log('[AutoFaceRecognition] Face recognition failed, creating temporary person')
+            
+            // Set latestPersonData for the unknown person so buttons appear
+            setLatestPersonData({
+              name: "Unknown Person",
+              description: "Just met",
+              relationship: "Unknown",
+              person_id: newUnknownId
+            })
+            
+            // Associate this unknown person with this specific face
+            setFacePersonData((prev: FacePersonMap) => {
+              const newMap = new Map(prev)
+              newMap.set(face.id, {
+                name: "Unknown Person",
+                description: "Just met",
+                relationship: "Unknown",
+                person_id: newUnknownId
+              })
+              return newMap
+            })
+            
+            // Create a temporary person entry for the unknown person
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Check if person already exists
+            let shouldCreateTempPerson = true;
+            try {
+              const peopleResponse = await fetch(`${OFFER_BACKEND_URL}/people`);
+              if (peopleResponse.ok) {
+                const people = await peopleResponse.json();
+                // Look for a person with this person_id
+                const existingUnknown = people.find((p: any) => 
+                  p.person_id === newUnknownId
+                );
+                
+                if (existingUnknown) {
+                  console.log('[AutoFaceRecognition] Temporary person already exists, skipping creation');
+                  shouldCreateTempPerson = false;
+                }
+              }
+            } catch (error) {
+              console.error('[AutoFaceRecognition] Error checking for existing temporary person:', error);
+            }
+            
+            if (shouldCreateTempPerson) {
               const tempPersonResponse = await fetch(`${OFFER_BACKEND_URL}/person`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -442,34 +765,110 @@ export function WebcamStream() {
                   person_id: newUnknownId,
                   name: "Unknown Person",
                   relationship: "Unknown",
-                  aggregated_context: "Recently detected unknown person",
-                  cached_description: "Recently detected unknown person"
+                  aggregated_context: "Just met",
+                  cached_description: "Just met"
                 })
               }).catch(error => {
                 console.error('[AutoFaceRecognition] Network error creating person:', error);
-                throw new Error(`Failed to connect to backend: ${error.message}`);
+                // Continue even if person creation fails
               });
               
-              if (tempPersonResponse.ok) {
-                console.log('[AutoFaceRecognition] Created temporary person entry for unknown person')
-                // Immediately capture face embedding for this unknown person
-                await captureFaceEmbedding(newUnknownId)
-                // Keep the latestPersonData set so buttons remain visible
+              if (tempPersonResponse && tempPersonResponse.ok) {
+                console.log('[AutoFaceRecognition] Created temporary person entry for unknown person after recognition failure')
               }
             }
           }
-        } else {
-          console.error('[AutoFaceRecognition] Failed to recognize face:', response.status)
         }
       } catch (error) {
         console.error('[AutoFaceRecognition] Error during face recognition:', error)
+        // Even if recognition fails, we still want to create a temporary person
+        if (!unknownPersonId) {
+          const newUnknownId = `unknown_${Date.now()}_${face.id}`
+          setUnknownPersonId(newUnknownId)
+          setIsListeningForName(true)
+          console.log('[AutoFaceRecognition] Face recognition error, creating temporary person')
+          
+          // Set latestPersonData for the unknown person so buttons appear
+          setLatestPersonData({
+            name: "Unknown Person",
+            description: "Just met",
+            relationship: "Unknown",
+            person_id: newUnknownId
+          })
+          
+          // Associate this unknown person with this specific face
+          setFacePersonData((prev: FacePersonMap) => {
+            const newMap = new Map(prev)
+            newMap.set(face.id, {
+              name: "Unknown Person",
+              description: "Just met",
+              relationship: "Unknown",
+              person_id: newUnknownId
+            })
+            return newMap
+          })
+          
+          // Create a temporary person entry for the unknown person
+          // BUT first check if a person with this name already exists
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Check if person already exists
+          let shouldCreateTempPerson = true;
+          try {
+            const peopleResponse = await fetch(`${OFFER_BACKEND_URL}/people`);
+            if (peopleResponse.ok) {
+              const people = await peopleResponse.json();
+              // Look for a person with this person_id
+              const existingUnknown = people.find((p: any) => 
+                p.person_id === newUnknownId
+              );
+              
+              if (existingUnknown) {
+                console.log('[AutoFaceRecognition] Temporary person already exists, skipping creation');
+                shouldCreateTempPerson = false;
+              }
+            }
+          } catch (error) {
+            console.error('[AutoFaceRecognition] Error checking for existing temporary person:', error);
+          }
+          
+          if (shouldCreateTempPerson) {
+            const tempPersonResponse = await fetch(`${OFFER_BACKEND_URL}/person`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                person_id: newUnknownId,
+                name: "Unknown Person",
+                relationship: "Unknown",
+                aggregated_context: "Just met",
+                cached_description: "Just met"
+              })
+            }).catch(error => {
+              console.error('[AutoFaceRecognition] Network error creating person:', error);
+              // Continue even if person creation fails
+            });
+            
+            if (tempPersonResponse && tempPersonResponse.ok) {
+              console.log('[AutoFaceRecognition] Created temporary person entry for unknown person after recognition error')
+            }
+          }
+        }
       }
-    } catch (err) {
-      console.error('[AutoFaceRecognition] Error extracting face embedding:', err)
+    } catch (error) {
+      console.error('[AutoFaceRecognition] Error extracting face embedding:', error)
     }
   }
 
   const extractNameAndRelationshipFromSpeech = (text: string): {name: string | null, relationship: string | null} => {
+    // Handle empty or failed transcriptions
+    if (!text || text.trim() === "" || 
+        text.includes("Model loading failed") || 
+        text.includes("Transcription failed") || 
+        text.includes("Whisper not installed")) {
+      console.log('[NameExtraction] Empty or failed transcription, cannot extract name/relationship');
+      return {name: null, relationship: null};
+    }
+    
     // Extract name
     const namePatterns = [
       /i\s+am\s+([a-zA-Z\s]+)/i,
@@ -530,6 +929,27 @@ export function WebcamStream() {
       // Add a small delay to ensure backend is ready
       await new Promise(resolve => setTimeout(resolve, 500));
       
+      // First, check if a person with this name already exists in the database
+      let existingPerson = null;
+      try {
+        const peopleResponse = await fetch(`${OFFER_BACKEND_URL}/people`);
+        if (peopleResponse.ok) {
+          const people = await peopleResponse.json();
+          // Look for a person with the same name (case insensitive)
+          existingPerson = people.find((p: any) => 
+            p.name && p.name.toLowerCase() === name.toLowerCase()
+          );
+          
+          if (existingPerson) {
+            console.log(`[PersonCreation] Found existing person with name ${name}:`, existingPerson);
+            // If we found an existing person, use their ID instead of creating a new one
+            existingPersonId = existingPerson.person_id;
+          }
+        }
+      } catch (error) {
+        console.error('[PersonCreation] Error checking for existing person:', error);
+      }
+      
       // If we have an existing person ID, update the existing person
       if (existingPersonId) {
         console.log(`[PersonCreation] Updating existing person ${existingPersonId} with name: ${name}`)
@@ -545,53 +965,163 @@ export function WebcamStream() {
           })
         }).catch(error => {
           console.error('[PersonCreation] Network error updating person:', error);
-          throw new Error(`Failed to connect to backend: ${error.message}`);
+          // Continue with fallback approach
+          return null;
         })
         
-        if (response.ok) {
+        if (response && response.ok) {
           const person = await response.json()
           console.log('[PersonCreation] Updated person:', person)
           return person
-        } else {
+        } else if (response) {
           console.error('[PersonCreation] Failed to update person:', response.status)
           // Try to get more details about the error
-          const errorText = await response.text();
-          console.error('[PersonCreation] Error details:', errorText);
-          return null
+          try {
+            const errorText = await response.text();
+            console.error('[PersonCreation] Error details:', errorText);
+          } catch (e) {
+            console.error('[PersonCreation] Could not read error details');
+          }
+          // Still return a basic person object so the process can continue
+          return {
+            person_id: existingPersonId,
+            name: name,
+            relationship: relationship
+          }
+        } else {
+          // Network error occurred, but we still want to continue
+          console.log('[PersonCreation] Network error, continuing with basic person object')
+          return {
+            person_id: existingPersonId,
+            name: name,
+            relationship: relationship
+          }
         }
       } else {
         // Create a new person
-        const personId = `person_${Date.now()}`
-        const response = await fetch(`${OFFER_BACKEND_URL}/person`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            person_id: personId,
-            name: name,
-            relationship: relationship, // Use provided relationship or default
-            aggregated_context: `Just met ${name}`,
-            cached_description: `Just met ${name}`
-          })
-        }).catch(error => {
-          console.error('[PersonCreation] Network error creating person:', error);
-          throw new Error(`Failed to connect to backend: ${error.message}`);
-        })
+        // But first check if a person with this name already exists
+        let shouldCreatePerson = true;
+        try {
+          const peopleResponse = await fetch(`${OFFER_BACKEND_URL}/people`);
+          if (peopleResponse.ok) {
+            const people = await peopleResponse.json();
+            // Look for a person with this name
+            const existingPerson = people.find((p: any) => 
+              p.name.toLowerCase() === name.toLowerCase()
+            );
+            
+            if (existingPerson) {
+              console.log('[PersonCreation] Person with this name already exists, updating existing person');
+              existingPersonId = existingPerson.person_id;
+              shouldCreatePerson = false;
+              
+              // Update the existing person
+              const response = await fetch(`${OFFER_BACKEND_URL}/person/${existingPersonId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  name: name,
+                  relationship: relationship, // Use provided relationship or default
+                  aggregated_context: `Just met ${name}`,
+                  cached_description: `Just met ${name}`
+                })
+              }).catch(error => {
+                console.error('[PersonCreation] Network error updating person:', error);
+                // Continue with fallback approach
+                return null;
+              })
+              
+              if (response && response.ok) {
+                const person = await response.json()
+                console.log('[PersonCreation] Updated existing person:', person)
+                return person
+              } else if (response) {
+                console.error('[PersonCreation] Failed to update existing person:', response.status)
+                // Try to get more details about the error
+                try {
+                  const errorText = await response.text();
+                  console.error('[PersonCreation] Error details:', errorText);
+                } catch (e) {
+                  console.error('[PersonCreation] Could not read error details');
+                }
+                // Still return a basic person object so the process can continue
+                return {
+                  person_id: existingPersonId,
+                  name: name,
+                  relationship: relationship
+                }
+              } else {
+                // Network error occurred, but we still want to continue
+                console.log('[PersonCreation] Network error, continuing with basic person object')
+                return {
+                  person_id: existingPersonId,
+                  name: name,
+                  relationship: relationship
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('[PersonCreation] Error checking for existing person:', error);
+        }
         
-        if (response.ok) {
-          const person = await response.json()
-          console.log('[PersonCreation] Created person:', person)
-          return person
-        } else {
-          console.error('[PersonCreation] Failed to create person:', response.status)
-          // Try to get more details about the error
-          const errorText = await response.text();
-          console.error('[PersonCreation] Error details:', errorText);
-          return null
+        if (shouldCreatePerson) {
+          const personId = `person_${Date.now()}`
+          const response = await fetch(`${OFFER_BACKEND_URL}/person`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              person_id: personId,
+              name: name,
+              relationship: relationship, // Use provided relationship or default
+              aggregated_context: `Meet ${name}`,
+              cached_description: `Meet ${name}`
+            })
+          }).catch(error => {
+            console.error('[PersonCreation] Network error creating person:', error);
+            // Continue with fallback approach
+            return null;
+          })
+          
+          if (response && response.ok) {
+            const person = await response.json()
+            console.log('[PersonCreation] Created person:', person)
+            return person
+          } else if (response) {
+            console.error('[PersonCreation] Failed to create person:', response.status)
+            // Try to get more details about the error
+            try {
+              const errorText = await response.text();
+              console.error('[PersonCreation] Error details:', errorText);
+            } catch (e) {
+              console.error('[PersonCreation] Could not read error details');
+            }
+            // Still return a basic person object so the process can continue
+            return {
+              person_id: personId,
+              name: name,
+              relationship: relationship
+            }
+          } else {
+            // Network error occurred, but we still want to continue
+            console.log('[PersonCreation] Network error, continuing with basic person object')
+            return {
+              person_id: personId,
+              name: name,
+              relationship: relationship
+            }
+          }
         }
       }
     } catch (err) {
       console.error('[PersonCreation] Error creating/updating person:', err)
-      return null
+      // Return a basic person object so the process can continue
+      const personId = existingPersonId || `person_${Date.now()}`
+      return {
+        person_id: personId,
+        name: name,
+        relationship: relationship
+      }
     }
   }
 
@@ -699,21 +1229,35 @@ export function WebcamStream() {
                   // Update latestPersonData with the identified person's information
                   setLatestPersonData({
                     name: name,
-                    description: `Just met ${name}`,
+                    description: `Meet ${name}`,
                     relationship: personRelationship,
-                    person_id: person.person_id || unknownPersonId
+                    person_id: unknownPersonId
                   })
                   
                   // After creating/updating the person, capture their face embedding
                   if ((person.person_id || unknownPersonId) && videoRef.current && canvasRef.current) {
                     // Capture face embedding for the updated person
-                    captureFaceEmbedding(person.person_id || unknownPersonId!)
+                    captureFaceEmbedding(person.person_id || unknownPersonId!).catch((embeddingError) => {
+                      console.error('[FaceEmbedding] Failed to capture face embedding:', embeddingError)
+                      // Don't fail the whole process if face embedding fails
+                      alert(`Successfully identified ${name} but failed to capture face embedding. You can try again later.`)
+                    })
                   }
                 }
               })
               setIsListeningForName(false)
               setUnknownPersonId(null)
               break
+            } else if (utterance.text && 
+                      !utterance.text.includes("Model loading failed") && 
+                      !utterance.text.includes("Transcription failed") && 
+                      !utterance.text.includes("Whisper not installed") &&
+                      utterance.text.trim() !== "") {
+              // If we got a transcription but couldn't extract name, log it for debugging
+              console.log(`[NameDetection] Transcription received but no name found: "${utterance.text}"`)
+            } else {
+              // Log failed transcription
+              console.log(`[NameDetection] Transcription failed: "${utterance.text}"`)
             }
           }
         }
@@ -993,18 +1537,24 @@ export function WebcamStream() {
           </div>
 
           <div className="absolute top-4 right-4 flex items-center gap-2 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
-            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} ${isConnected ? 'animate-pulse' : ''}`} />
-            <span className="text-xs text-white/80">{isConnected ? 'Connected (WebSocket)' : 'Disconnected'}</span>
+            <div className={`w-2 h-2 rounded-full ${isSessionActive ? 'bg-green-500' : 'bg-yellow-500'} ${isSessionActive ? 'animate-pulse' : ''}`} />
+            <span className="text-xs text-white/80">{isSessionActive ? 'Active Session' : 'Idle Session'}</span>
+          </div>
+
+          {/* Connection Status Indicator - Shows only Connected or Disconnected */}
+          <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
+            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+            <span className="text-xs text-white/80">{isConnected ? 'Connected' : 'Disconnected'}</span>
           </div>
 
           {isModelLoading && (
-            <div className="absolute top-4 left-4 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
+            <div className="absolute top-16 left-4 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
               <span className="text-xs text-white/80">Loading face recognition models...</span>
             </div>
           )}
-          
+      
           {isFaceDetectionLoading && (
-            <div className="absolute top-4 left-4 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
+            <div className="absolute top-16 left-4 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
               <span className="text-xs text-white/80">Loading face detection...</span>
             </div>
           )}
@@ -1038,7 +1588,7 @@ export function WebcamStream() {
                   // Update the latest person data with the identified information
                   setLatestPersonData({
                     name,
-                    description: `Identified as ${name}`,
+                    description: `Just met ${name}`,
                     relationship,
                     person_id: unknownPersonId
                   })
@@ -1160,7 +1710,7 @@ const extractFaceEmbedding = async (canvas: HTMLCanvasElement): Promise<number[]
 
         // Send to backend service with timeout
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 30 second timeout
         
         try {
           const response = await fetch('http://localhost:8001/extract_embedding', {

@@ -1,6 +1,6 @@
 # ForgetMeNot - Dementia Care Assistant System
 
-A multimodal AI system designed to support people with dementia by helping them recognize and remember loved ones through real-time audio processing, face recognition, and contextual memory assistance. This innovative solution combines cutting-edge artificial intelligence with augmented reality technology to provide meaningful cognitive support through AR glasses, helping individuals with dementia maintain connections with family members and friends. The system addresses the progressive memory loss and recognition difficulties that characterize dementia by offering gentle, context-aware reminders and personalized information displays that enhance daily interactions and quality of life for both patients and their families.
+A multimodal AI system designed to support people with dementia by helping them recognize and remember loved ones through real-time audio processing, face recognition, and contextual memory assistance. This innovative solution combines cutting-edge artificial intelligence with augmented reality technology to provide meaningful cognitive support through AR glasses, helping individuals with dementia maintain connections with family members and friends.
 
 ## Overview
 
@@ -46,35 +46,6 @@ graph TB
     style F fill:#e8f5e8
     style G fill:#e1f5fe
     style H fill:#f1f8e9
-```
-
-## Data Flow
-
-```mermaid
-graph LR
-    A[Webcam/Audio<br/>Input] --> B[Frontend<br/>WebRTC Stream]
-    B --> C[Main Backend<br/>WebRTC Ingest]
-    C --> D[Audio Pipeline<br/>Denoising/VAD/Speaker Diarization]
-    D --> E[Whisper<br/>Transcription]
-    E --> F[Inference Service<br/>Context Analysis]
-    F --> G[MongoDB<br/>Context Storage]
-    C --> H[Face Recognition<br/>Service]
-    H --> I[MTCNN/FaceNet<br/>Embedding Extraction]
-    I --> G
-    G --> J[AR Display<br/>Context Retrieval]
-    J --> K[Frontend/SSE<br/>AR Overlay]
-    
-    style A fill:#e1f5fe
-    style B fill:#f3e5f5
-    style C fill:#e8f5e8
-    style D fill:#e8f5e8
-    style E fill:#e8f5e8
-    style F fill:#e8f5e8
-    style G fill:#fff3e0
-    style H fill:#e8f5e8
-    style I fill:#e8f5e8
-    style J fill:#e8f5e8
-    style K fill:#f3e5f5
 ```
 
 ## Technology Stack
@@ -148,8 +119,7 @@ python start_all_services.py
 
 Terminal 1: Face Recognition Service
 ```bash
-cd backend/face_recognition_service
-python main.py
+python -m uvicorn backend.face_recognition_service.main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
 Terminal 2: Main Backend

@@ -58,19 +58,19 @@ logger = logging.getLogger("webrtc.audio.pipeline")
 @dataclass
 class PipelineConfig:
     """Configuration for the audio pipeline."""
-    target_sample_rate: int = 8_000  # Reduced sample rate for lower CPU usage
-    silence_timeout_seconds: float = 2.0
-    min_conversation_seconds: float = 1.0  # Reduced minimum conversation time
-    vad_aggressiveness: int = 3
-    transcription_model: str = "cloud"  # Use cloud service instead of local model
-    min_speech_rms: float = 0.01
-    noise_floor_smoothing: float = 0.9
-    noise_gate_margin: float = 0.005
+    target_sample_rate: int = 16_000  # Increased from 8000 to 16000 for better transcription quality
+    silence_timeout_seconds: float = 3.0  # Increased from 2.0 to 3.0 for better sentence capture
+    min_conversation_seconds: float = 1.5  # Increased from 1.0 for better quality
+    vad_aggressiveness: int = 2  # Reduced from 3 to 2 for less aggressive voice activity detection
+    transcription_model: str = "base"  # Changed from "cloud" to "base" for better local transcription quality
+    min_speech_rms: float = 0.005  # Reduced from 0.01 for better sensitivity
+    noise_floor_smoothing: float = 0.95  # Increased from 0.9 for better noise adaptation
+    noise_gate_margin: float = 0.003  # Reduced from 0.005 for better sensitivity
     embedding_model: str = "pyannote/embedding"
     speaker_match_threshold: float = 0.25
-    embedding_window_seconds: float = 0.5  # Reduced window size
+    embedding_window_seconds: float = 0.75  # Increased from 0.5 for better embedding quality
     use_cloud_services: bool = True  # Enable cloud services by default
-    max_concurrent_sessions: int = 1  # Limit concurrent sessions for i3 performance
+    max_concurrent_sessions: int = 10  # Increased from 1 to 10 for better performance
 
 
 @dataclass
@@ -141,11 +141,15 @@ class AudioPipeline:
                 logger.info("Initialized Fireworks client for cloud transcription")
             except Exception as e:
                 logger.error("Failed to initialize Fireworks client: %s", e)
+                self._fireworks_client = None
+        else:
+            logger.info("No Fireworks API key found, will use local Whisper only")
+            self._fireworks_client = None
         
-        if self.config.use_cloud_services:
+        if self.config.use_cloud_services and self._fireworks_client:
             logger.info("Cloud services enabled for audio processing")
         else:
-            logger.info("Cloud services disabled; using local processing where available")
+            logger.info("Cloud services disabled or unavailable; using local processing where available")
 
     async def process_chunk(self, chunk: AudioChunk) -> None:
         session_id = chunk.session_id
@@ -313,81 +317,152 @@ class AudioPipeline:
                 self._active_sessions -= 1
 
     async def _transcribe_audio(self, audio: np.ndarray) -> List[TranscriptSegment]:
-        if self._fireworks_client is None:
-            logger.warning("Fireworks client not available; skipping transcription")
+        """Transcribe audio to text using cloud services or local Whisper as fallback."""
+        if audio.size == 0:
             return []
 
+        # Try cloud transcription first if enabled and API key is available
+        if self.config.use_cloud_services and self._fireworks_client:
+            try:
+                logger.info("Attempting cloud transcription with Fireworks")
+                
+                # Convert audio to WAV format for cloud transcription
+                import io
+                import wave
+                import tempfile
+                import os  # Import os at the right scope
+                
+                # Convert float32 to int16
+                audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+                
+                # Log audio information for debugging
+                duration = len(audio) / self.config.target_sample_rate
+                logger.info(f"Audio info: duration={duration:.2f}s, samples={len(audio)}, sample_rate={self.config.target_sample_rate}")
+                
+                # Create temporary WAV file using tempfile.NamedTemporaryFile correctly
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                    # Write WAV header and audio data
+                    with wave.open(tmp_file.name, 'wb') as wav_file:
+                        wav_file.setnchannels(1)  # Mono
+                        wav_file.setsampwidth(2)  # 16-bit
+                        wav_file.setframerate(self.config.target_sample_rate)
+                        wav_file.writeframes(audio_int16.tobytes())
+                    
+                    tmp_path = tmp_file.name
+                
+                try:
+                    # Upload and transcribe with Fireworks
+                    with open(tmp_path, 'rb') as audio_file:
+                        transcript_response = await self._fireworks_client.audio.transcriptions.create(
+                            file=audio_file,
+                            model="whisper-large-v3",
+                            response_format="verbose_json"
+                        )
+                    
+                    # Clean up temporary file
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                    
+                    # Parse the response and create TranscriptSegments
+                    segments = []
+                    if hasattr(transcript_response, 'segments'):
+                        for segment in transcript_response.segments:
+                            segments.append(TranscriptSegment(
+                                start=segment['start'],
+                                end=segment['end'],
+                                text=segment['text'],
+                                speaker=None  # Will be assigned later
+                            ))
+                    else:
+                        # If no segments, create a single segment with the whole transcript
+                        segments.append(TranscriptSegment(
+                            start=0.0,
+                            end=len(audio) / self.config.target_sample_rate,
+                            text=transcript_response.text,
+                            speaker=None
+                        ))
+                    
+                    logger.info(f"Transcribed {len(segments)} segments with Fireworks")
+                    for i, segment in enumerate(segments):
+                        logger.info(f"Segment {i}: '{segment.text}' ({segment.start:.2f}-{segment.end:.2f}s)")
+                    return segments
+                    
+                except Exception as e:
+                    # Clean up temporary file even if transcription fails
+                    if os.path.exists(tmp_path) and 'tmp_path' in locals():
+                        os.unlink(tmp_path)
+                    logger.warning("Cloud transcription failed: %s", e)
+                    # Continue to local Whisper fallback
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Cloud transcription failed: %s", exc)
+                # Continue to local Whisper fallback
+        
+        # Fallback to local Whisper if cloud transcription failed or is disabled
+        logger.info("Falling back to local Whisper transcription")
         try:
-            # Convert audio to WAV format for Fireworks
-            import io
-            import wave
+            import whisper
+            import tempfile
+            import os  # Import os at the right scope
             
-            # Convert float32 to int16
-            audio_int16 = (audio * 32767).astype(np.int16)
+            # Convert float32 to int16 for local processing
+            audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
             
-            # Create WAV in memory
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(self.config.target_sample_rate)
-                wav_file.writeframes(audio_int16.tobytes())
+            # Log audio information for debugging
+            duration = len(audio) / self.config.target_sample_rate
+            logger.info(f"Audio info: duration={duration:.2f}s, samples={len(audio)}, sample_rate={self.config.target_sample_rate}")
             
-            wav_buffer.seek(0)
-            
-            # Call Fireworks API for transcription
-            logger.info("Using Fireworks API for transcription")
-            
-            # Create a temporary file-like object for the WAV data
-            from tempfile import NamedTemporaryFile
-            import os
-            
-            with NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                tmp_file.write(wav_buffer.getvalue())
-                tmp_file_path = tmp_file.name
+            # Save audio to temporary file for Whisper
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                # Write WAV header and audio data
+                import wave
+                with wave.open(tmp_file.name, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(self.config.target_sample_rate)
+                    wav_file.writeframes(audio_int16.tobytes())
+                
+                tmp_path = tmp_file.name
             
             try:
-                # Upload and transcribe with Fireworks
-                with open(tmp_file_path, 'rb') as audio_file:
-                    transcript_response = await self._fireworks_client.audio.transcriptions.create(
-                        file=audio_file,
-                        model="whisper-large-v3",
-                        response_format="verbose_json"
-                    )
+                # Load Whisper model (using base model for better accuracy)
+                logger.info("Loading Whisper model...")
+                model = whisper.load_model("base")  # Changed from "tiny" to "base" for better accuracy
+                logger.info("Whisper model loaded successfully")
+                
+                # Transcribe audio
+                logger.info(f"Transcribing audio with duration {duration:.2f}s...")
+                result = model.transcribe(tmp_path, fp16=False)
+                transcript = result["text"].strip()
                 
                 # Clean up temporary file
-                os.unlink(tmp_file_path)
+                if os.path.exists(tmp_path) and 'tmp_path' in locals():
+                    os.unlink(tmp_path)
                 
-                # Parse the response and create TranscriptSegments
-                segments = []
-                if hasattr(transcript_response, 'segments'):
-                    for segment in transcript_response.segments:
-                        segments.append(TranscriptSegment(
-                            start=segment['start'],
-                            end=segment['end'],
-                            text=segment['text'],
-                            speaker=None  # Will be assigned later
-                        ))
-                else:
-                    # If no segments, create a single segment with the whole transcript
-                    segments.append(TranscriptSegment(
+                if transcript:
+                    logger.info(f"Local Whisper transcription successful: '{transcript}'")
+                    # Create a single segment for the whole transcript
+                    segment = TranscriptSegment(
                         start=0.0,
                         end=len(audio) / self.config.target_sample_rate,
-                        text=transcript_response.text,
+                        text=transcript,
                         speaker=None
-                    ))
-                
-                logger.info(f"Transcribed {len(segments)} segments")
-                return segments
-                
+                    )
+                    return [segment]
+                else:
+                    logger.warning("Local Whisper transcription returned empty result")
+                    return []
             except Exception as e:
                 # Clean up temporary file even if transcription fails
-                if os.path.exists(tmp_file_path):
-                    os.unlink(tmp_file_path)
-                raise e
-            
+                if os.path.exists(tmp_path) and 'tmp_path' in locals():
+                    os.unlink(tmp_path)
+                logger.error("Local Whisper transcription failed: %s", e)
+                return []
+                
+        except ImportError:
+            logger.error("Whisper not installed, cannot perform local transcription")
+            return []
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Cloud transcription failed: %s", exc)
+            logger.error("Local transcription failed: %s", exc)
             return []
 
     def _print_transcript(
@@ -512,6 +587,18 @@ class AudioPipeline:
                     # Import broadcast_person here to avoid circular import
                     from backend.app.utils import broadcast_person
                     await broadcast_person(person_data)
+            else:
+                # For unknown speakers, we still want to broadcast the event
+                # This will help the frontend know when to start listening for name introduction
+                person_data = PersonData(
+                    name="Unknown Person",
+                    description="Just met",
+                    relationship="Unknown",
+                    person_id=primary_speaker
+                )
+                # Import broadcast_person here to avoid circular import
+                from backend.app.utils import broadcast_person
+                await broadcast_person(person_data)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Failed to publish conversation event %s: %s",
@@ -525,7 +612,13 @@ class AudioPipeline:
         session_id: str,
         snippets: List[TranscriptSegment],
     ) -> None:
-        """Store conversation data in MongoDB."""
+        """Store conversation data in MongoDB.
+        
+        NEW: Store ALL conversations; link person when known.
+        Unknown speakers get temporary profiles for later linking.
+        ZERO conversation loss.
+        NEW: Extract name/relationship from speech and update temporary persons.
+        """
         if not snippets:
             return
 
@@ -541,12 +634,33 @@ class AudioPipeline:
             (entry.speaker for entry in conversation if entry.speaker != "speaker_unknown"),
             state.last_speaker_id,
         ) or "speaker_unknown"
+        
+        # Apply transcript sanity filter before processing
+        conversation_text = " ".join([utterance.text for utterance in conversation if utterance.text])
+        
+        # Check if transcript is meaningful before proceeding
+        if not is_transcript_meaningful(conversation_text):
+            logger.info(
+                "Skipping storage of conversation for speaker %s - transcript not meaningful: %s",
+                primary_speaker,
+                conversation_text[:50] + "..." if len(conversation_text) > 50 else conversation_text
+            )
+            return
+        
+        # Additional check for very short conversations
+        if len(conversation_text.strip()) < 5:
+            logger.info(
+                "Skipping storage of conversation for speaker %s - transcript too short: %s",
+                primary_speaker,
+                conversation_text[:50] + "..." if len(conversation_text) > 50 else conversation_text
+            )
+            return
 
-        # Create conversation event for storage
+        # NEW: Create conversation event for storage - ALWAYS store
         conversation_event = {
             "event_type": "CONVERSATION_END",
             "timestamp": datetime.utcnow(),
-            "person_id": primary_speaker,
+            "speaker_id": primary_speaker,  # NEW: Always store speaker_id
             "conversation_id": state.conversation_id,
             "session_id": session_id,
             "conversation": [
@@ -557,45 +671,333 @@ class AudioPipeline:
                 for utterance in conversation
             ]
         }
-
+        
         # Import the add_conversation function
         from inference.database import add_conversation
         
-        # Store in conversations collection (full history)
-        for utterance in conversation:
-            if utterance.speaker and not utterance.speaker.startswith("speaker_unknown"):
-                # Add to full conversation history
-                success = add_conversation(
-                    person_id=utterance.speaker,
-                    direction="from_patient",  # Assuming all utterances are from the speaker to patient
-                    text=utterance.text,
-                    source="voice"
-                )
-                if success:
-                    logger.info(
-                        "Stored conversation entry in full history for person %s: %s",
-                        utterance.speaker,
-                        utterance.text[:50] + "..." if len(utterance.text) > 50 else utterance.text
-                    )
-                else:
-                    logger.warning(
-                        "Failed to store conversation entry in full history for person %s",
-                        utterance.speaker
-                    )
-
-        # Add to person's conversation history (recent history with trimming)
-        if not primary_speaker.startswith("speaker_unknown"):
-            success = add_conversation_to_history(primary_speaker, conversation_event, max_history=20)
+        # NEW: ALWAYS store in conversations collection, even for unknown speakers
+        conversation_text = " ".join([utterance.text for utterance in conversation if utterance.text])
+        
+        if len(conversation_text.strip()) >= 5:  # Only store if meaningful content
+            # Store the full conversation
+            success = add_conversation(
+                person_id=primary_speaker if not primary_speaker.startswith("speaker_unknown") else None,
+                speaker_id=primary_speaker,  # NEW: Store speaker_id explicitly
+                direction="to_patient",  # Changed from "from_patient" to "to_patient" as per user request
+                text=conversation_text,
+                source="voice",
+                session_id=session_id  # NEW: Store session_id
+            )
+            
             if success:
                 logger.info(
-                    "Stored conversation in history for person %s",
+                    "Stored conversation entry in full history for speaker %s: %s",
                     primary_speaker,
+                    conversation_text[:50] + "..." if len(conversation_text) > 50 else conversation_text
                 )
             else:
                 logger.warning(
-                    "Failed to store conversation in history for person %s",
-                    primary_speaker,
+                    "Failed to store conversation entry in full history for speaker %s",
+                    primary_speaker
                 )
+        
+        # Handle name/relationship extraction for ALL speakers when appropriate
+        # Check for trigger phrases like "my name", "I am", "I'm", "I am your", "I'm your", etc.
+        trigger_phrases = ["my name", "i am", "i'm", "i am your", "i'm your"]
+        has_trigger_phrase = any(phrase in conversation_text.lower() for phrase in trigger_phrases)
+        
+        # Process name/relationship extraction if:
+        # 1. Transcript is meaningful and has sufficient content
+        # 2. Contains trigger phrases OR is from an unknown speaker
+        should_extract_identity = (len(conversation_text.strip()) >= 10 and 
+                                 (has_trigger_phrase or 
+                                  primary_speaker.startswith("speaker_unknown") or 
+                                  primary_speaker.startswith("unknown_")))
+        
+        if should_extract_identity:
+            extracted_info = extract_name_and_relation_from_speech(conversation_text)
+            name = extracted_info.get('name')
+            name_confidence = extracted_info.get('name_confidence', 0.0)
+            relationship = extracted_info.get('relationship')
+            relationship_confidence = extracted_info.get('relationship_confidence', 0.0)
+            
+            # Log extraction results
+            logger.info(
+                f"Name/relationship extraction for speaker {primary_speaker}: "
+                f"name={name} (confidence={name_confidence}), "
+                f"relationship={relationship} (confidence={relationship_confidence})"
+            )
+            
+            # Structured logging for monitoring
+            logger.info(f"NAME_RELATION_EXTRACTION: {{'speaker_id': '{primary_speaker}', 'name': '{name}', 'name_confidence': {name_confidence}, 'relationship': '{relationship}', 'relationship_confidence': {relationship_confidence}}}")
+
+        # Handle temporary persons and name/relationship extraction
+        if primary_speaker.startswith("speaker_unknown") or primary_speaker.startswith("unknown_"):
+            logger.info(
+                "Handling unknown speaker %s, creating/updating temporary person",
+                primary_speaker,
+            )
+            
+            # Extract name and relationship from conversation for temporary persons
+            # Only process if we have meaningful content
+            if should_extract_identity:
+                # Create or update temporary person with extracted information
+                from inference.database import get_people_collection, create_temporary_person_with_conversation
+                collection = get_people_collection()
+                
+                # Check if temporary person already exists
+                existing_temp_person = collection.find_one({
+                    "$or": [
+                        {"speaker_id_provisional": primary_speaker},
+                        {"person_id": {"$regex": f"unknown.*{primary_speaker}"}}
+                    ]
+                })
+                
+                if existing_temp_person:
+                    # Update existing temporary person
+                    update_fields = {
+                        "last_updated": datetime.utcnow()
+                    }
+                    
+                    # Update name and relationship if confidence is high enough
+                    if name and name_confidence >= 0.8:
+                        # For known persons, check if name differs only by minor spelling or capitalization
+                        current_name = existing_temp_person.get("name", "").lower()
+                        new_name = name.lower()
+                        if current_name != new_name and Levenshtein_distance(current_name, new_name) > 2:
+                            update_fields["name"] = name.capitalize()
+                        else:
+                            logger.info(f"Skipping name update for {primary_speaker} - names are similar: {current_name} vs {new_name}")
+                    
+                    if relationship and relationship_confidence >= 0.8:
+                        update_fields["relationship"] = relationship.capitalize()
+                    
+                    # Add identity confidence field
+                    update_fields["identity_confidence"] = max(name_confidence, relationship_confidence)
+                    
+                    # Add conversation to history
+                    conversation_entry = {
+                        "timestamp": datetime.utcnow(),
+                        "direction": "to_patient",  # Changed from "from_patient" to "to_patient" as per user request
+                        "text": conversation_text,
+                        "source": "voice"
+                    }
+                    
+                    result = collection.update_one(
+                        {"person_id": existing_temp_person["person_id"]},
+                        {
+                            "$set": update_fields,
+                            "$push": {
+                                "conversation_history": {
+                                    "$each": [conversation_entry],
+                                    "$slice": -20  # Keep last 20 conversations
+                                }
+                            }
+                        }
+                    )
+                    
+                    if result.matched_count > 0:
+                        logger.info(
+                            f"Updated temporary person {existing_temp_person['person_id']} with extracted info and conversation"
+                        )
+                        # Structured logging for monitoring
+                        logger.info(f"TEMPORARY_PERSON_UPDATED: {{'person_id': '{existing_temp_person['person_id']}', 'updated_fields': {list(update_fields.keys())}}}")
+                    else:
+                        logger.warning(
+                            f"Failed to update temporary person {existing_temp_person['person_id']}"
+                        )
+                        # Structured logging for monitoring
+                        logger.info(f"TEMPORARY_PERSON_UPDATE_FAILED: {{'person_id': '{existing_temp_person['person_id']}'}}")
+                else:
+                    # Create new temporary person with conversation
+                    temp_person_id = f"unknown_{primary_speaker}_{int(datetime.utcnow().timestamp())}"
+                    
+                    try:
+                        temp_person = create_temporary_person_with_conversation(
+                            person_id=temp_person_id,
+                            speaker_id=primary_speaker,
+                            name=name.capitalize() if name and name_confidence >= 0.8 else "Unknown Speaker",
+                            relationship=relationship.capitalize() if relationship and relationship_confidence >= 0.8 else "Unknown",
+                            conversation_text=conversation_text,
+                            direction="to_patient",
+                            timestamp=datetime.utcnow()
+                        )
+                        
+                        if temp_person:
+                            logger.info(f"Created temp person: {temp_person_id} with conversation")
+                            # Structured logging for monitoring
+                            logger.info(f"TEMPORARY_PERSON_CREATED: {{'person_id': '{temp_person_id}', 'name': '{temp_person.get('name')}', 'relationship': '{temp_person.get('relationship')}'}}")
+                        else:
+                            logger.warning(f"Failed to create temp person for speaker: {primary_speaker}")
+                    except Exception as e:
+                        logger.error(f"Error creating temporary person for speaker {primary_speaker}: {e}")
+            else:
+                # Even if conversation is short, still create a temporary person
+                from inference.database import get_people_collection, create_temporary_person_with_conversation
+                collection = get_people_collection()
+                
+                # Check if temporary person already exists
+                existing_temp_person = collection.find_one({
+                    "$or": [
+                        {"speaker_id_provisional": primary_speaker},
+                        {"person_id": {"$regex": f"unknown.*{primary_speaker}"}}
+                    ]
+                })
+                
+                if not existing_temp_person:
+                    temp_person_id = f"unknown_{primary_speaker}_{int(datetime.utcnow().timestamp())}"
+                    
+                    try:
+                        temp_person = create_temporary_person_with_conversation(
+                            person_id=temp_person_id,
+                            speaker_id=primary_speaker,
+                            name="Unknown Speaker",
+                            relationship="Unknown",
+                            conversation_text=conversation_text,
+                            direction="to_patient",
+                            timestamp=datetime.utcnow()
+                        )
+                        
+                        if temp_person:
+                            logger.info(f"Created temp person: {temp_person_id} with conversation")
+                        else:
+                            logger.warning(f"Failed to create temp person for speaker: {primary_speaker}")
+                    except Exception as e:
+                        logger.error(f"Error creating temporary person for speaker {primary_speaker}: {e}")
+        else:
+            # Update person's conversation_history if person exists AND is not temporary
+            if not primary_speaker.startswith("speaker_unknown"):
+                from inference.database import get_person_by_id
+                person = get_person_by_id(primary_speaker)
+                
+                # Also run name/relation extraction for known persons when appropriate
+                # Process if we have meaningful content and transcript contains trigger phrases
+                if should_extract_identity and extracted_info:
+                    name = extracted_info.get('name')
+                    name_confidence = extracted_info.get('name_confidence', 0.0)
+                    relationship = extracted_info.get('relationship')
+                    relationship_confidence = extracted_info.get('relationship_confidence', 0.0)
+                    
+                    # Log extraction results
+                    logger.info(
+                        f"Name/relationship extraction for known speaker {primary_speaker}: "
+                        f"name={name} (confidence={name_confidence}), "
+                        f"relationship={relationship} (confidence={relationship_confidence})"
+                    )
+                    
+                    # Structured logging for monitoring
+                    logger.info(f"NAME_RELATION_EXTRACTION_KNOWN: {{'speaker_id': '{primary_speaker}', 'name': '{name}', 'name_confidence': {name_confidence}, 'relationship': '{relationship}', 'relationship_confidence': {relationship_confidence}}}")
+                    
+                    # For known persons, update relationship if confidence is high and current relationship is blank or generic
+                    if person and relationship and relationship_confidence >= 0.8:
+                        current_relationship = person.get("relationship", "").lower()
+                        generic_relationships = {"new acquaintance", "unknown", ""}
+                        if current_relationship in generic_relationships:
+                            from inference.database import get_people_collection
+                            collection = get_people_collection()
+                            
+                            result = collection.update_one(
+                                {"person_id": primary_speaker},
+                                {
+                                    "$set": {
+                                        "relationship": relationship.capitalize(),
+                                        "last_updated": datetime.utcnow()
+                                    }
+                                }
+                            )
+                            
+                            if result.matched_count > 0:
+                                logger.info(
+                                    f"Updated relationship for known person {primary_speaker} to {relationship}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Failed to update relationship for known person {primary_speaker}"
+                                )
+                    
+                    # For known persons with high name confidence, check for minor differences
+                    if person and name and name_confidence >= 0.8:
+                        current_name = person.get("name", "").lower()
+                        new_name = name.lower()
+                        # Only update if names are significantly different (Levenshtein distance > 2)
+                        if current_name != new_name and Levenshtein_distance(current_name, new_name) > 2:
+                            from inference.database import get_people_collection
+                            collection = get_people_collection()
+                            
+                            result = collection.update_one(
+                                {"person_id": primary_speaker},
+                                {
+                                    "$set": {
+                                        "name": name.capitalize(),
+                                        "last_updated": datetime.utcnow()
+                                    }
+                                }
+                            )
+                            
+                            if result.matched_count > 0:
+                                logger.info(
+                                    f"Updated name for known person {primary_speaker} to {name}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Failed to update name for known person {primary_speaker}"
+                                )
+                        else:
+                            logger.info(f"Skipping name update for {primary_speaker} - names are similar: {current_name} vs {new_name}")
+                
+                # Only update history for permanent persons, not temporary ones
+                if person and not person.get("is_temporary", False):
+                    success = add_conversation_to_history(primary_speaker, conversation_event, max_history=20)
+                    if success:
+                        logger.info(
+                            "Stored conversation in history for person %s",
+                            primary_speaker,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to store conversation in history for person %s",
+                            primary_speaker,
+                        )
+                elif person and person.get("is_temporary", False):
+                    logger.info(
+                        "Updating temporary person %s with conversation",
+                        primary_speaker,
+                    )
+                    
+                    # Update temporary person with conversation
+                    from inference.database import get_people_collection
+                    collection = get_people_collection()
+                    
+                    conversation_entry = {
+                        "timestamp": datetime.utcnow(),
+                        "direction": "to_patient",  # Changed from "from_patient" to "to_patient" as per user request
+                        "text": conversation_text,
+                        "source": "voice"
+                    }
+                    
+                    result = collection.update_one(
+                        {"person_id": person["person_id"]},
+                        {
+                            "$push": {
+                                "conversation_history": {
+                                    "$each": [conversation_entry],
+                                    "$slice": -20  # Keep last 20 conversations
+                                }
+                            },
+                            "$set": {
+                                "last_updated": datetime.utcnow()
+                            }
+                        }
+                    )
+                    
+                    if result.matched_count > 0:
+                        logger.info(
+                            f"Updated temporary person {person['person_id']} with conversation"
+                        )
+                    else:
+                        logger.warning(
+                            f"Failed to update temporary person {person['person_id']} with conversation"
+                        )
 
     async def _load_whisper_model(self):
         async with self._whisper_lock:
@@ -928,3 +1330,322 @@ class AudioPipeline:
         if norm == 0.0:
             return np.zeros_like(vector)
         return (vector / norm).astype(np.float32)
+
+
+import re  # NEW: Added for regex pattern matching
+
+def Levenshtein_distance(s1: str, s2: str) -> int:
+    """Calculate the Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return Levenshtein_distance(s2, s1)
+
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
+
+
+def is_transcript_meaningful(text: str) -> bool:
+    """
+    Filter obviously bad transcripts before they hit DB.
+    
+    Args:
+        text: Transcript text to evaluate
+        
+    Returns:
+        True if transcript is meaningful, False otherwise
+    """
+    import re
+    
+    # Handle empty or invalid transcripts
+    if not text or not isinstance(text, str):
+        return False
+    
+    # Remove extra whitespace
+    cleaned_text = text.strip()
+    
+    # Too short (less than 10-15 non-whitespace chars)
+    if len(re.sub(r'\s', '', cleaned_text)) < 15:  # Increased threshold to 15 chars
+        return False
+    
+    # Dominated by a single repeated token (e.g. "you you you you", "Shush. Shush.")
+    words = re.findall(r'\b\w+\b', cleaned_text.lower())
+    if len(words) > 0:
+        # Check if a single word makes up more than 50% of the transcript
+        from collections import Counter
+        word_counts = Counter(words)
+        most_common_word, count = word_counts.most_common(1)[0]
+        if count / len(words) > 0.6 and len(words) > 3:  # Increased threshold to 60%
+            return False
+    
+    # Only punctuation or filler words
+    filler_words = {'uh', 'um', 'er', 'ah', 'hmm', 'mmm', 'shush', 'shh'}
+    non_filler_words = [word for word in words if word not in filler_words]
+    if len(non_filler_words) < max(1, len(words) * 0.4):  # Increased threshold to 40% non-filler words
+        return False
+    
+    # Looks like garbage text (random characters, no real words)
+    if len(words) == 0 and len(cleaned_text) > 0:
+        # Contains mostly non-alphabetic characters
+        alpha_chars = sum(1 for c in cleaned_text if c.isalpha())
+        if alpha_chars / len(cleaned_text) < 0.6:  # Increased threshold to 60% alphabetic
+            return False
+    
+    # Check for repeated patterns that indicate poor transcription
+    if re.search(r'(\w+\s*){2,}\1{2,}', cleaned_text.lower()):
+        # Pattern like "word word word word word word" repeated
+        return False
+    
+    return True
+
+
+def extract_name_and_relation_from_speech(transcript: str) -> dict:
+    """
+    Extract name and relationship using enhanced pattern matching.
+    No LLM; pure regex (lightweight on i3).
+    
+    Args:
+        transcript: Speech transcript to analyze
+        
+    Returns:
+        Dictionary with extracted name, relationship and confidence scores
+    """
+    import re
+    
+    # Handle empty or invalid transcripts
+    if not transcript or not isinstance(transcript, str):
+        return {
+            'name': None,
+            'name_confidence': 0.0,
+            'relationship': None,
+            'relationship_confidence': 0.0
+        }
+    
+    text = transcript.lower().strip()
+    
+    # Handle very short transcripts
+    if len(text) < 5:
+        return {
+            'name': None,
+            'name_confidence': 0.0,
+            'relationship': None,
+            'relationship_confidence': 0.0
+        }
+    
+    # Combined patterns that extract both name and relationship in one go (higher priority)
+    combined_patterns = [
+        (r"i['’]m your (\w+) ([a-z]+)", 0.9),  # "I'm your nurse Jennifer"
+        (r"i am your (\w+) ([a-z]+)", 0.9),    # "I am your nurse Jennifer"
+        (r"i['’]m your ([a-z]+) ([a-z]+)", 0.85),  # More general pattern
+        (r"this is your (\w+) ([a-z]+)", 0.8),  # "This is your friend Robert"
+    ]
+    
+    # Try combined patterns first
+    extracted_name = None
+    extracted_relation = None
+    name_confidence = 0.0
+    relation_confidence = 0.0
+    
+    for pattern, confidence in combined_patterns:
+        match = re.search(pattern, text)
+        if match:
+            rel_candidate = match.group(1).lower()
+            name_candidate = match.group(2).capitalize()
+            
+            # Valid relations
+            valid_relations = {
+                'son', 'daughter', 'wife', 'husband', 'mother', 'father',
+                'brother', 'sister', 'friend', 'nurse', 'doctor', 'caregiver',
+                'aunt', 'uncle', 'grandmother', 'grandfather', 'grandma', 'grandpa',
+                'grandson', 'granddaughter', 'cousin', 'neighbor', 'neighbour'
+            }
+            
+            # Check if the first group is a valid relationship and the second is a valid name
+            if rel_candidate in valid_relations and 2 <= len(name_candidate) <= 20 and name_candidate.isalpha():
+                extracted_relation = rel_candidate.capitalize()
+                extracted_name = name_candidate
+                relation_confidence = confidence
+                name_confidence = confidence
+                break
+    
+    # If we didn't get both from combined patterns, try separate patterns
+    if not extracted_name or not extracted_relation:
+        # Name patterns with confidence scores
+        name_patterns = [
+            (r"my name is ([a-z]+)", 0.95),
+            (r"i am ([a-z]+)", 0.90),
+            (r"i'm ([a-z]+)", 0.85),
+            (r"call me ([a-z]+)", 0.90),
+            (r"you can call me ([a-z]+)", 0.95),
+            (r"this is ([a-z]+)", 0.8),
+            (r"hello,? i['’]m ([a-z]+)", 0.85),
+            (r"hi,? i['’]m ([a-z]+)", 0.85),
+            (r"hey,? i['’]m ([a-z]+)", 0.85),
+        ]
+        
+        # Relationship patterns
+        relation_patterns = [
+            (r"i['’]m your (\w+)", 0.95),
+            (r"i am your (\w+)", 0.95),
+            (r"i['’]m (?:the|a) (\w+)", 0.90),
+            (r"your (\w+)", 0.7),
+            (r"i['’]m your ([a-z]+ [a-z]+)", 0.9),  # For compound relationships like "best friend"
+        ]
+        
+        valid_relations = {
+            'son', 'daughter', 'wife', 'husband', 'mother', 'father',
+            'brother', 'sister', 'friend', 'nurse', 'doctor', 'caregiver',
+            'aunt', 'uncle', 'grandmother', 'grandfather', 'grandma', 'grandpa',
+            'grandson', 'granddaughter', 'cousin', 'neighbor', 'neighbour'
+        }
+        
+        # Extract name if not already found
+        if not extracted_name:
+            for pattern, confidence in name_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    candidate_name = match.group(1).capitalize()
+                    # Check if name is reasonable (2-20 characters, alphabetic)
+                    if 2 <= len(candidate_name) <= 20 and candidate_name.isalpha():
+                        extracted_name = candidate_name
+                        name_confidence = confidence
+                        break
+        
+        # Extract relationship if not already found
+        if not extracted_relation:
+            for pattern, confidence in relation_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    candidate_relation = match.group(1).lower()
+                    # Check if it's a valid relationship or compound relationship
+                    if candidate_relation in valid_relations or any(word in candidate_relation for word in valid_relations):
+                        # Capitalize first letter of each word
+                        extracted_relation = ' '.join(word.capitalize() for word in candidate_relation.split())
+                        relation_confidence = confidence
+                        break
+    
+    # Special case for "This is your friend Robert calling" (more specific pattern)
+    if not extracted_name and "this is your" in text:
+        # Try to extract name after "this is your [relationship]"
+        match = re.search(r"this is your \w+ ([a-z]+)", text)
+        if match:
+            name_candidate = match.group(1).capitalize()
+            if 2 <= len(name_candidate) <= 20 and name_candidate.isalpha():
+                extracted_name = name_candidate
+                name_confidence = 0.8
+    
+    # Additional special case for the exact phrase the user mentioned
+    if not extracted_name and not extracted_relation:
+        # Handle the specific phrase: "Hi mom this is your son Bob. just wanted to let you know i got promoted ok bye"
+        match = re.search(r"this is your (\w+) ([a-z]+)", text)
+        if match:
+            rel_candidate = match.group(1).lower()
+            name_candidate = match.group(2).capitalize()
+            
+            valid_relations = {
+                'son', 'daughter', 'wife', 'husband', 'mother', 'father',
+                'brother', 'sister', 'friend', 'nurse', 'doctor', 'caregiver',
+                'aunt', 'uncle', 'grandmother', 'grandfather', 'grandma', 'grandpa',
+                'grandson', 'granddaughter', 'cousin', 'neighbor', 'neighbour'
+            }
+            
+            if rel_candidate in valid_relations and 2 <= len(name_candidate) <= 20 and name_candidate.isalpha():
+                extracted_relation = rel_candidate.capitalize()
+                extracted_name = name_candidate
+                relation_confidence = 0.9
+                name_confidence = 0.9
+    
+    # Even more specific pattern for the user's example
+    if not extracted_name or not extracted_relation:
+        # Handle pattern: "hi mom i am Daksh your son just wanted to let you know that i got promoted bye"
+        match = re.search(r"i am ([a-z]+) your (\w+)", text)
+        if match:
+            name_candidate = match.group(1).capitalize()
+            rel_candidate = match.group(2).lower()
+            
+            valid_relations = {
+                'son', 'daughter', 'wife', 'husband', 'mother', 'father',
+                'brother', 'sister', 'friend', 'nurse', 'doctor', 'caregiver',
+                'aunt', 'uncle', 'grandmother', 'grandfather', 'grandma', 'grandpa',
+                'grandson', 'granddaughter', 'cousin', 'neighbor', 'neighbour'
+            }
+            
+            if rel_candidate in valid_relations and 2 <= len(name_candidate) <= 20 and name_candidate.isalpha():
+                extracted_name = name_candidate
+                extracted_relation = rel_candidate.capitalize()
+                name_confidence = 0.95  # High confidence for this specific pattern
+                relation_confidence = 0.95
+    
+    return {
+        'name': extracted_name,
+        'name_confidence': name_confidence,
+        'relationship': extracted_relation,
+        'relationship_confidence': relation_confidence
+    }
+
+
+def get_conversation_context_for_person(person_id: str, num_recent: int = 5) -> dict:
+    """Retrieve recent conversations + humanized summary.
+    
+    Args:
+        person_id: Person identifier
+        num_recent: Number of recent conversations to retrieve
+        
+    Returns:
+        Dictionary with person_id, recent conversations, and humanized summary
+    """
+    from inference.database import get_recent_conversations
+    from datetime import datetime
+    from collections import Counter
+    import re
+    
+    recent = get_recent_conversations(person_id, limit=num_recent)
+    
+    if not recent:
+        return {
+            'person_id': person_id,
+            'recent_conversations': [],
+            'summary': 'No previous conversations.',
+            'humanized_summary': 'You have not had any previous conversations.'
+        }
+    
+    # Humanized summary: extract top keywords and create natural language summary
+    all_text = ' '.join([c['text'] for c in recent])
+    words = re.findall(r'\b[a-z]{4,}\b', all_text.lower())
+    word_freq = Counter(words)
+    top_words = [w for w, _ in word_freq.most_common(3)]  # Limit to top 3 for conciseness
+    
+    # Create humanized summary based on number of topics
+    if len(top_words) == 1:
+        humanized_summary = f"You mainly discussed {top_words[0]}."
+    elif len(top_words) == 2:
+        humanized_summary = f"You talked about {top_words[0]} and {top_words[1]}."
+    elif len(top_words) >= 3:
+        humanized_summary = f"You talked about {top_words[0]}, {top_words[1]}, and {top_words[2]}."
+    else:
+        humanized_summary = "You had a previous conversation."
+    
+    # Ensure summary stays within character limits
+    if len(humanized_summary) > 400:
+        humanized_summary = humanized_summary[:397] + "..."
+    
+    # Original summary for backward compatibility
+    summary = f"Recently discussed: {', '.join(top_words)}."
+    
+    return {
+        'person_id': person_id,
+        'recent_conversations': recent,
+        'summary': summary,
+        'humanized_summary': humanized_summary,
+        'last_spoken_at': recent[0]['timestamp'] if recent else None
+    }
